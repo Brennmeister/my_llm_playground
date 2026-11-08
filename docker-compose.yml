@@ -1,0 +1,64 @@
+# One command:  docker compose up --build
+# API + Swagger UI: http://localhost:8000/docs
+#
+# Values like MODEL_FILE / API_PORT are read from .env (optional, see .env.example).
+
+services:
+  llm:
+    # llama.cpp server, CPU build (pinned). Ubuntu 24.04 based.
+    image: ghcr.io/ggml-org/llama.cpp:server-b12199
+    command:
+      - --hf-repo
+      - ${MODEL_REPO:-unsloth/Qwen3.5-0.8B-GGUF}
+      - --hf-file
+      - ${MODEL_FILE:-Qwen3.5-0.8B-Q8_0.gguf}
+      - --alias
+      - qwen3.5-0.8b
+      - --ctx-size
+      - "${LLM_CTX:-8192}"
+      - --parallel
+      - "1"
+      - --jinja
+      - --no-webui
+    environment:
+      LLAMA_ARG_HOST: 0.0.0.0
+      LLAMA_ARG_PORT: "8080"
+      LLAMA_CACHE: /models          # model is downloaded once into the volume
+      # LLAMA_ARG_THREADS: "6"      # notebook: number of physical performance cores
+    volumes:
+      - llm-models:/models
+    # Not published to the host - only the API talks to the LLM.
+    # Uncomment to debug the LLM directly on http://localhost:8081
+    # ports:
+    #   - "127.0.0.1:8081:8080"
+    deploy:
+      resources:
+        limits:
+          memory: 4G                 # keeps the notebook responsive (model needs ~1.5 GB)
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 300s             # first start downloads the model (~0.8 GB)
+    restart: unless-stopped
+
+  api:
+    build: .
+    image: order-extractor-api:latest
+    depends_on:
+      llm:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      LLM_BASE_URL: http://llm:8080
+      LLM_MODEL_NAME: qwen3.5-0.8b
+    ports:
+      # Bound to localhost only. Use "${API_PORT:-8000}:8000" to make it reachable in your LAN.
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    restart: unless-stopped
+
+volumes:
+  llm-models:

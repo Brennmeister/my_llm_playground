@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project
+models/
+bin/
+logs/
+*.gguf
+samples/

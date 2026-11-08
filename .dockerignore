@@ -1,0 +1,11 @@
+.git
+.venv
+.env
+bin
+models
+logs
+samples
+tests
+scripts
+**/__pycache__
+*.gguf
