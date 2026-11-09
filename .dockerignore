@@ -6,6 +6,8 @@ models
 logs
 samples
 tests
-scripts
+!scripts/
+scripts/*
+!scripts/install_pdfjs.sh
 **/__pycache__
 *.gguf

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Order review</title>
+  <link rel="stylesheet" href="/static/review.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/review" aria-label="Order review home"><span class="brand-mark">O</span> Order review</a>
+    <div id="status" class="status-pill">Loading review…</div>
+    <a class="new-review" href="/review">+ New document</a>
+  </header>
+  <main>
+    <section id="upload-screen" class="upload-screen" hidden>
+      <div class="upload-card">
+        <span class="eyebrow">LOCAL DOCUMENT PROCESSING</span>
+        <h1>Review purchase orders,<br>with the source in view.</h1>
+        <p>Upload a PDF to extract order fields locally, check every value against its source, and approve a verified ERP-ready export.</p>
+        <form id="upload-form">
+          <label class="file-picker" for="pdf-file">
+            <span class="upload-icon">↑</span>
+            <strong>Choose a purchase order PDF</strong>
+            <span id="file-name">PDF up to 25 MB</span>
+          </label>
+          <input id="pdf-file" type="file" accept="application/pdf,.pdf" required>
+          <label class="ocr-choice">Text extraction
+            <select name="ocr"><option value="auto">Automatic (recommended)</option><option value="always">Force OCR</option><option value="never">Text layer only</option></select>
+          </label>
+          <button class="primary" type="submit">Extract and start review <span>→</span></button>
+          <p id="upload-error" class="error" role="alert"></p>
+        </form>
+        <div class="privacy-note"><span>●</span> PDFs and extracted data stay on this machine.</div>
+      </div>
+      <aside class="workflow-card">
+        <span class="eyebrow">HOW IT WORKS</span>
+        <div class="workflow-step"><span>01</span><div><strong>Extract</strong><small>Local OCR and Qwen model</small></div></div>
+        <div class="workflow-step"><span>02</span><div><strong>Verify</strong><small>Match each value to the PDF</small></div></div>
+        <div class="workflow-step"><span>03</span><div><strong>Approve</strong><small>Download ERP-ready JSON</small></div></div>
+      </aside>
+    </section>
+
+    <section id="review-screen" class="review-screen" hidden>
+      <aside class="data-panel">
+        <div class="panel-heading">
+          <div><span class="eyebrow">PURCHASE ORDER</span><h1 id="document-title">Review extracted data</h1></div>
+          <span id="field-count" class="count-pill"></span>
+        </div>
+        <div id="attention" class="attention" hidden></div>
+        <div id="field-list" class="field-list"></div>
+        <div class="panel-actions">
+          <button id="save-button" class="secondary">Save corrections</button>
+          <button id="approve-button" class="primary">Approve for ERP <span>→</span></button>
+          <a id="export-link" class="export-link" hidden>Download approved JSON</a>
+        </div>
+        <div id="toast" class="toast" role="status"></div>
+      </aside>
+      <section class="pdf-panel">
+        <div class="pdf-toolbar">
+          <div><span class="eyebrow">SOURCE DOCUMENT</span><strong id="pdf-name">Original PDF</strong></div>
+          <div class="zoom-tools">
+            <label class="pdf-search"><input id="pdf-search" type="search" placeholder="Find in PDF" aria-label="Find text in PDF"><span id="search-count"></span></label>
+            <button id="search-prev" aria-label="Previous search result">↑</button><button id="search-next" aria-label="Next search result">↓</button>
+            <button id="zoom-out" aria-label="Zoom out">−</button><span id="zoom-value">100%</span><button id="zoom-in" aria-label="Zoom in">+</button>
+          </div>
+        </div>
+        <div id="pdf-pages" class="pdf-pages"></div>
+      </section>
+    </section>
+  </main>
+  <script src="/static/review.js" defer></script>
+</body>
+</html>

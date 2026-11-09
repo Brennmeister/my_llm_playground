@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     max_chars_per_chunk: int = 9000
     max_upload_mb: int = 25
     max_pages: int = 30
+    review_db_path: str = "data/order_reviews.sqlite3"
 
     # --- OCR ---------------------------------------------------------------------
     ocr_languages: str = "deu+eng+pol+ita"

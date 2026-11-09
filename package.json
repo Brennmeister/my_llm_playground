@@ -1,0 +1,9 @@
+{
+  "name": "order-review-pdf-viewer-assets",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Pinned local PDF.js assets for the order review UI",
+  "dependencies": {
+    "pdfjs-dist": "5.4.624"
+  }
+}

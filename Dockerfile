@@ -1,4 +1,10 @@
 # FastAPI order extractor (the LLM runs in the separate "llm" service, see docker-compose.yml)
+FROM node:22-alpine AS pdfjs-assets
+WORKDIR /build
+COPY package.json package-lock.json ./
+COPY scripts/install_pdfjs.sh ./scripts/
+RUN ./scripts/install_pdfjs.sh
+
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -17,8 +23,11 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY app ./app
+COPY --from=pdfjs-assets /build/app/static/vendor/pdfjs ./app/static/vendor/pdfjs
 
-RUN useradd --create-home --uid 1000 appuser
+RUN useradd --create-home --uid 1000 appuser \
+ && mkdir -p /data \
+ && chown appuser:appuser /data
 USER appuser
 
 EXPOSE 8000

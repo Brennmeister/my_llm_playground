@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Installs everything needed to run the order extractor:
-#   1. System packages: Tesseract OCR (+ German, English, Polish, Italian language packs)
+#   1. System packages: Tesseract OCR (+ German, English, Polish, Italian language packs), Node.js/npm
 #   2. Python virtualenv (.venv) with requirements.txt
 #   3. llama.cpp's llama-server (prebuilt release; CUDA build if an NVIDIA GPU is found)
 #   4. Qwen3.5-0.8B GGUF model (from Hugging Face into ./models)
@@ -45,22 +45,29 @@ OS="$(uname -s)"
 # 1. System packages
 # ---------------------------------------------------------------------------
 if [ "$SKIP_SYSTEM" -eq 0 ]; then
-  log "Installing system packages (Tesseract OCR, Python venv, tools)"
+  log "Installing system packages (Tesseract OCR, Node.js/npm, Python venv, tools)"
   SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
   if [ "$OS" = "Darwin" ]; then
     command -v brew >/dev/null || { echo "Homebrew required: https://brew.sh"; exit 1; }
-    brew install tesseract tesseract-lang python@3.12 curl
+    brew install tesseract tesseract-lang python@3.12 node curl
   elif command -v apt-get >/dev/null; then
     $SUDO apt-get update
-    $SUDO apt-get install -y python3 python3-venv python3-pip curl tar unzip ca-certificates libgomp1 \
+    $SUDO apt-get install -y python3 python3-venv python3-pip nodejs npm curl tar unzip ca-certificates libgomp1 \
       tesseract-ocr tesseract-ocr-deu tesseract-ocr-eng tesseract-ocr-pol tesseract-ocr-ita
   elif command -v dnf >/dev/null; then
-    $SUDO dnf install -y python3 python3-pip curl tar unzip libgomp \
+    $SUDO dnf install -y python3 python3-pip nodejs npm curl tar unzip libgomp \
       tesseract tesseract-langpack-deu tesseract-langpack-eng tesseract-langpack-pol tesseract-langpack-ita
   else
-    echo "Unsupported package manager - install tesseract (deu, eng, pol, ita) manually, then use --no-system."
+    echo "Unsupported package manager - install tesseract (deu, eng, pol, ita), Node.js/npm manually, then use --no-system."
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# PDF.js browser assets (served locally; no runtime CDN)
+# ---------------------------------------------------------------------------
+log "Installing local PDF.js browser assets"
+command -v npm >/dev/null || { echo "npm is required to install PDF.js assets (or use the Docker image)."; exit 1; }
+scripts/install_pdfjs.sh
 
 # ---------------------------------------------------------------------------
 # 2. Python environment

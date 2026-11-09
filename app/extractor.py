@@ -22,7 +22,7 @@ from .normalize import (
     split_postal_city,
     valid_email,
 )
-from .pdf_extract import OcrMode, chunk_pages, extract_text
+from .pdf_extract import OcrMode, PdfText, chunk_pages, extract_text
 from .schemas import (
     Contact,
     DocumentHeader,
@@ -348,9 +348,14 @@ async def _extract_chunk(chunk: str, info: str, warnings: list[str]) -> RawOrder
     return RawOrder.model_validate(parts)
 
 
-async def extract_order(pdf_bytes: bytes, filename: Optional[str], ocr: OcrMode = "auto") -> ErpOrder:
+async def extract_order(
+    pdf_bytes: bytes,
+    filename: Optional[str],
+    ocr: OcrMode = "auto",
+    pdf_text: Optional[PdfText] = None,
+) -> ErpOrder:
     t0 = time.perf_counter()
-    pdf = extract_text(pdf_bytes, ocr)
+    pdf = pdf_text or extract_text(pdf_bytes, ocr)
     full_text = pdf.full_text
     lang = detect_language(full_text)
 

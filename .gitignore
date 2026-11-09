@@ -225,3 +225,6 @@ bin/
 logs/
 *.gguf
 samples/
+data/
+node_modules/
+app/static/vendor/pdfjs/

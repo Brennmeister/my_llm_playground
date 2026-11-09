@@ -55,6 +55,9 @@ services:
     environment:
       LLM_BASE_URL: http://llm:8080
       LLM_MODEL_NAME: qwen3.5-0.8b
+      REVIEW_DB_PATH: /data/order_reviews.sqlite3
+    volumes:
+      - review-data:/data
     ports:
       # Bound to localhost only. Use "${API_PORT:-8000}:8000" to make it reachable in your LAN.
       - "127.0.0.1:${API_PORT:-8000}:8000"
@@ -62,3 +65,4 @@ services:
 
 volumes:
   llm-models:
+  review-data:
