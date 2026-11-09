@@ -120,8 +120,17 @@ to a person for review.
 
 The browser workflow keeps the PDF beside the extracted fields. Native PDF text and OCR output
 include word-level boxes; matching values get color-coded SVG highlights, and unmatched or
-incomplete values are flagged for review. Click a field to locate its source, or click a highlight
-to focus its field. Corrections can be saved with the button or `Ctrl+S`/`Cmd+S`; approving requires
+incomplete values are flagged for review. The PDF is shown on the left, the fields on the right
+(grouped sections, line items as a table). Clicking a field scrolls the PDF to its source and highlights
+it lightly; clicking a highlight focuses its field. A dot per field shows its state (found in the PDF,
+not found, missing, changed), and the list at the top jumps to every value that still needs a check.
+Saved corrections are matched against the PDF again.
+Values that differ slightly from the PDF text (wrapped lines, OCR slips) get an *approximate* location
+(dashed highlight with similarity), and values repaired from the arithmetic point to their table row
+with the reason. **Enter confirms a field** - also when its value stays unchanged - saves it and moves
+to the next open field; confirmed values no longer count as open issues (recorded in the history).
+The *Extraction run* panel shows the model, file, context size, total/OCR/LLM time, token counts and
+tokens per second. Corrections can be saved with the button or `Ctrl+S`/`Cmd+S`; approving requires
 all required values and acknowledgement of remaining extraction warnings. Only approved orders
 can be downloaded from the ERP JSON endpoint.
 
@@ -151,6 +160,21 @@ the persistent `review-data` volume; native runs use `data/order_reviews.sqlite3
   - Buyer and supplier are swapped back if the address labels (`An`, `To`, `Lieferant`,
     `Dostawca`, `Fornitore`, ...) show the opposite.
   - Net and gross totals are repaired when the arithmetic doesn't add up.
+  - Summary rows (Summe, Versand, Total, Razem, Totale, ...) returned as line items are dropped;
+    item descriptions that don't occur in the PDF are flagged.
+- **The LLM reads the positions, the code checks them:** the model sees the document with numbered
+  lines (`L12: ...`) and returns every position with the lines it comes from, so any table layout works
+  (one line per position, values and article on separate lines, ...). A layout-agnostic check verifies
+  that quantity, price, total and article number really occur in those lines and that
+  quantity x price = total; failing positions get a focused second LLM call on just their lines plus
+  the table header. The printed net total is used as a numeric cross-check for misread amounts. Every
+  correction is listed as a warning. A deterministic row parser (`app/table_rows.py`) is only a fallback
+  when the model returns no positions at all.
+- **Label fallback for key header fields:** order number, order date, delivery date and customer
+  number are also looked up next to their printed labels (DE/EN/PL/IT). This fills fields the model
+  missed and fixes the common "customer number returned as order number" mix-up.
+- **No silent truncation:** the line item pass has its own larger output budget; if the output is
+  still cut off, the complete rows are kept and a warning is added.
 - **Resource-friendly server settings:**
   - Q8_0 quantization: about 0.8 GB RAM, the best quality for this model size.
   - `--parallel 1` and an 8k context.
@@ -164,13 +188,26 @@ Copy `.env.example` to `.env`. `install.sh` does this for you. Environment varia
 
 | Variable | Default | Notes |
 |---|---|---|
-| `MODEL_FILE` | `Qwen3.5-0.8B-Q8_0.gguf` | `Qwen3.5-0.8B-Q4_K_M.gguf` for very low-RAM machines |
+| `MODEL_REPO` / `MODEL_FILE` / `LLM_MODEL_NAME` | Qwen3.5-0.8B Q8_0 | Model choice, see below |
 | `LLM_THREADS` | auto | Set to the number of **physical performance cores** on hybrid notebook CPUs |
 | `LLM_CTX` | `8192` | Context window |
 | `API_PORT` | `8000` | |
 | `OWN_COMPANY_NAMES` | – | Your company name(s). Recommended: helps tell buyer and supplier apart |
 | `MAX_CHARS_PER_CHUNK` | `9000` | PDF text per LLM call |
+| `LLM_MAX_TOKENS_ITEMS` | `4096` | Output budget of the line item pass (~80 tokens per row) |
 | `OCR_LANGUAGES` | `deu+eng+pol+ita` | Tesseract languages |
+
+### Choosing the model
+
+`.env` contains two ready-made blocks; keep exactly one active:
+
+| Model | File | RAM (total) | CPU speed (1-page order) | Use when |
+|---|---|---|---|---|
+| Qwen3.5-0.8B (default) | `Qwen3.5-0.8B-Q8_0.gguf`, 0.8 GB | ~1.5 GB | ~20–30 s | weakest devices, highest throughput |
+| Qwen3.5-2B | `Qwen3.5-2B-Q4_K_M.gguf`, 1.3 GB | ~2.5 GB | ~2–2.5× slower | better parties, tables and long orders |
+
+Both run on CPU-only edge devices. After switching, run `./install.sh` (native, downloads the file) or
+`docker compose up` (the `llm` service downloads it into its volume).
 
 ## GPU (optional)
 
@@ -193,6 +230,9 @@ app/
   review_store.py  SQLite review sessions, correction history, source matching
   static/          Browser review UI, SVG source highlights, and locally bundled PDF.js
   extractor.py     pipeline: chunks -> 2 LLM passes -> merge -> sanity checks -> ERP model
+  labels.py        deterministic label lookup for order/customer number and dates
+  verify.py        row check of the LLM's positions, focused re-read, net total cross-check
+  table_rows.py    fallback line item parser for row-wise tables (only if the LLM finds none)
   llm.py           llama-server client, prompts (multilingual label hints)
   pdf_extract.py   PyMuPDF text extraction, Tesseract OCR, chunking
   normalize.py     locale-aware numbers/dates, units, currencies, countries, grounding

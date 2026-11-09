@@ -13,7 +13,7 @@ services:
       - --hf-file
       - ${MODEL_FILE:-Qwen3.5-0.8B-Q8_0.gguf}
       - --alias
-      - qwen3.5-0.8b
+      - ${LLM_MODEL_NAME:-qwen3.5-0.8b}
       - --ctx-size
       - "${LLM_CTX:-8192}"
       - --parallel
@@ -34,7 +34,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G                 # keeps the notebook responsive (model needs ~1.5 GB)
+          memory: 4G                 # keeps the device responsive (0.8B needs ~1.5 GB, 2B Q4_K_M ~2.5 GB)
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s
@@ -54,7 +54,7 @@ services:
         required: false
     environment:
       LLM_BASE_URL: http://llm:8080
-      LLM_MODEL_NAME: qwen3.5-0.8b
+      LLM_MODEL_NAME: ${LLM_MODEL_NAME:-qwen3.5-0.8b}
       REVIEW_DB_PATH: /data/order_reviews.sqlite3
     volumes:
       - review-data:/data

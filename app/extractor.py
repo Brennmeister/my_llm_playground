@@ -8,7 +8,7 @@ from typing import Optional
 
 from pydantic import ValidationError
 
-from . import llm
+from . import labels, llm
 from .config import settings
 from .normalize import (
     Grounder,
@@ -23,6 +23,8 @@ from .normalize import (
     valid_email,
 )
 from .pdf_extract import OcrMode, PdfText, chunk_pages, extract_text
+from .table_rows import TableRow, parse_rows, reconcile_with_net_total, rows_look_reliable
+from .verify import arithmetic_ok, reconcile_items_with_net_total, reread_failed_items
 from .schemas import (
     Contact,
     DocumentHeader,
@@ -49,6 +51,13 @@ _TOTAL_FIELDS = ("net_total", "tax_rate", "tax_amount", "gross_total")
 # Labels that typically appear right before the supplier / buyer address block
 _SUPPLIER_LABELS = re.compile(r"\b(an|to|lieferant|supplier|vendor|dostawca|sprzedawca|fornitore|spett\.?\s*le|destinatario)\b", re.I)
 _BUYER_LABELS = re.compile(r"\b(besteller|auftraggeber|buyer|customer|bill to|invoice to|zamawiający|nabywca|committente|acquirente|cliente)\b", re.I)
+# Summary rows that small models sometimes return as line items
+_SUMMARY_ROW = re.compile(
+    r"^\W*(zwischen)?(summe|gesamt\w*|total\w*|subtotal|netto\w*|brutto\w*|mwst|ust|vat|iva|imponibile|"
+    r"versand\w*|fracht\w*|porto|verpackung|shipping|freight|packaging|razem|suma|podatek|wysy\w*|"
+    r"spedizione|trasporto|imballo)\b",
+    re.I,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +165,10 @@ def sanitize(raw: RawOrder, text: str, warnings: list[str]) -> RawOrder:
     for it in raw.line_items:
         if clean_str(it.customer_article_number) and clean_str(it.customer_article_number) == clean_str(it.article_number):
             it.customer_article_number = None
+        article = clean_str(it.article_number)
+        if article and re.fullmatch(r"[\d.,]+\s*(\S+)", article) and normalize_unit(article.split()[-1]):
+            warnings.append(f"Article number '{article}' is a quantity with unit - removed.")
+            it.article_number = None
         for f in ("article_number", "customer_article_number"):
             v = clean_str(getattr(it, f))
             if v and not g.has(v):
@@ -222,35 +235,66 @@ def _repair_totals(t: Totals, warnings: list[str]) -> None:
     t.net_amount, t.tax_amount, t.gross_amount = net, tax, gross
 
 
-def normalize_order(raw: RawOrder, lang: Optional[str], full_text: str) -> ErpOrder:
-    warnings: list[str] = []
-    raw = sanitize(raw, full_text, warnings) if full_text else raw
+def apply_label_fallbacks(raw: RawOrder, text: str, lang: Optional[str], warnings: list[str]) -> RawOrder:
+    """Fill or fix the key header fields from their printed labels (deterministic)."""
+    raw = raw.model_copy(deep=True)
+    printed_dates = labels.dates_in_text(text, lang)
+    for field in ("order_date", "requested_delivery_date"):
+        value = clean_str(getattr(raw, field))
+        iso = parse_date(value, lang) if value else None
+        if value and printed_dates and iso not in printed_dates:
+            warnings.append(f"{field} '{value}' does not occur in the document - removed.")
+            setattr(raw, field, None)
+    order_number = labels.find_order_number(text)
+    customer_number = labels.find_customer_number(text)
+    # Typical small-model mix-up: the customer number is returned as the order number
+    if order_number and raw.order_number and clean_str(raw.order_number) != order_number \
+            and clean_str(raw.order_number) in (customer_number, clean_str(raw.customer_number)):
+        warnings.append(f"order_number '{raw.order_number}' is the customer number - replaced by '{order_number}'.")
+        raw.order_number = None
+    found = {
+        "order_number": order_number,
+        "customer_number": customer_number,
+        "order_date": labels.find_order_date(text, lang),
+        "requested_delivery_date": labels.find_delivery_date(text, lang),
+    }
+    if raw.requested_delivery_date and not found["requested_delivery_date"] \
+            and parse_date(raw.requested_delivery_date, lang) == parse_date(raw.order_date or found["order_date"], lang):
+        warnings.append(f"requested_delivery_date '{raw.requested_delivery_date}' is the order date and has no "
+                        "delivery label - removed.")
+        raw.requested_delivery_date = None
+    for field, value in found.items():
+        if value and not clean_str(getattr(raw, field)):
+            log.info("%s filled from document label: %r", field, value)
+            setattr(raw, field, value)
+    return raw
 
-    buyer, supplier = _party(raw.buyer), _party(raw.supplier)
-    if _is_own_company(buyer) and not _is_own_company(supplier):
-        buyer, supplier = supplier, buyer
-        warnings.append("Buyer and supplier swapped (buyer matched OWN_COMPANY_NAMES).")
 
-    header = DocumentHeader(
-        order_number=clean_str(raw.order_number),
-        order_date=parse_date(raw.order_date, lang),
-        requested_delivery_date=parse_date(raw.requested_delivery_date, lang),
-        customer_number=clean_str(raw.customer_number),
-        currency=normalize_currency(raw.currency, raw.gross_total, raw.net_total,
-                                    *(i.unit_price for i in raw.line_items[:3]))
-        or normalize_currency(None, full_text[:4000])
-        or settings.default_currency,
-        language=lang,
-        payment_terms=clean_str(raw.payment_terms),
-        incoterms=clean_str(raw.incoterms),
+def _is_summary_row(item: RawLineItem) -> bool:
+    description = clean_str(item.description) or ""
+    return bool(
+        not clean_str(item.article_number) and not clean_str(item.customer_article_number)
+        and len(description) < 40 and _SUMMARY_ROW.match(description)
     )
-    if raw.order_date and not header.order_date:
-        warnings.append(f"Could not parse order date '{raw.order_date}'.")
-    if raw.requested_delivery_date and not header.requested_delivery_date:
-        warnings.append(f"Could not parse delivery date '{raw.requested_delivery_date}'.")
 
+
+def _grounded_text(text: str, g: Grounder) -> bool:
+    """True if most words of a longer text occur in the document (allows small OCR/LLM drift)."""
+    words = [w for w in re.findall(r"[^\W_]{3,}", text)]
+    if not words:
+        return True
+    return sum(g.has(w) for w in words) / len(words) >= 0.6
+
+
+
+def _items_from_llm(raw: RawOrder, lang: Optional[str], header: DocumentHeader, grounder: Optional[Grounder],
+                    warnings: list[str]) -> tuple[list[LineItem], list[Optional[list[int]]]]:
     items: list[LineItem] = []
+    spans: list[Optional[list[int]]] = []
     for idx, ri in enumerate(raw.line_items, start=1):
+        if _is_summary_row(ri):
+            warnings.append(f"Ignored a summary row returned as line item: '{clean_str(ri.description)}'.")
+            continue
         qty = parse_number(ri.quantity, lang)
         price = parse_number(ri.unit_price, lang)
         disc = parse_number(ri.discount, lang) or None
@@ -287,8 +331,115 @@ def normalize_order(raw: RawOrder, lang: Optional[str], full_text: str) -> ErpOr
             continue  # garbage row
         if ri.unit and not item.unit_code:
             warnings.append(f"Position {position}: unknown unit '{ri.unit}'.")
+        if grounder and item.description and not _grounded_text(item.description, grounder):
+            warnings.append(f"Position {position}: description '{item.description}' not found in document - please verify.")
         items.append(item)
+        spans.append([ri.first_line, ri.last_line if ri.last_line is not None else ri.first_line]
+                     if ri.first_line is not None else None)
 
+    return items, spans
+
+
+def _items_from_rows(rows: list[TableRow], raw: RawOrder, header: DocumentHeader, grounder: Optional[Grounder],
+                     warnings: list[str]) -> list[LineItem]:
+    """Line items from the parsed table rows; the LLM only adds what the row text lacks."""
+    by_article = {clean_str(item.article_number): item for item in raw.line_items if clean_str(item.article_number)}
+    items: list[LineItem] = []
+    for index, row in enumerate(rows, start=1):
+        llm_item = by_article.pop(row.article_number, None) if row.article_number else None
+        position = row.position or index
+        description = row.description or (clean_str(llm_item.description) if llm_item else None)
+        customer_article = clean_str(llm_item.customer_article_number) if llm_item else None
+        if customer_article and grounder and not grounder.has(customer_article):
+            customer_article = None
+        items.append(LineItem(
+            position=position,
+            supplier_article_number=row.article_number,
+            customer_article_number=customer_article,
+            description=description,
+            quantity=row.quantity,
+            unit_code=normalize_unit(row.unit),
+            unit_raw=row.unit,
+            unit_price=row.unit_price,
+            discount_percent=row.discount_percent,
+            line_total=row.line_total,
+            requested_delivery_date=header.requested_delivery_date,
+        ))
+        warnings.extend(f"Position {position}: {note}." for note in row.notes)
+    for article, llm_item in by_article.items():
+        looks_like_quantity = re.fullmatch(r"[\d.,]+\s*(\S+)", article) and normalize_unit(article.split()[-1])
+        if grounder and grounder.has(article) and not _is_summary_row(llm_item) and not looks_like_quantity:
+            warnings.append(f"Article '{article}' was returned by the model but not found as a table row - not added, please check.")
+    log.info("Line items taken from %d parsed table rows", len(rows))
+    return items
+
+
+def _drop_stale_mismatch_warnings(items: list[LineItem], warnings: list[str]) -> None:
+    """Remove "quantity x unit price != line total" warnings of positions the net total check fixed."""
+    fixed = {str(item.position) for item in items
+             if arithmetic_ok(item.quantity, item.unit_price, item.line_total, item.discount_percent) is not False}
+    warnings[:] = [w for w in warnings
+                   if not (w.startswith("Position ") and "quantity x unit price" in w and w.split()[1].rstrip(":") in fixed)]
+
+
+def _drop_repeated_customer_articles(items: list[LineItem], header: DocumentHeader, warnings: list[str]) -> None:
+    """A 'customer article number' that equals the customer number or repeats on every row is a header value."""
+    values = [item.customer_article_number for item in items if item.customer_article_number]
+    repeated = len(items) > 1 and len(values) == len(items) and len(set(values)) == 1
+    for item in items:
+        if item.customer_article_number and (repeated or item.customer_article_number == header.customer_number):
+            item.customer_article_number = None
+    if repeated:
+        warnings.append(f"Removed customer article number '{values[0]}' repeated on every line (header value).")
+
+
+def normalize_order(raw: RawOrder, lang: Optional[str], full_text: str) -> ErpOrder:
+    warnings: list[str] = []
+    raw = sanitize(raw, full_text, warnings) if full_text else raw
+    if full_text:
+        raw = apply_label_fallbacks(raw, full_text, lang, warnings)
+    grounder = Grounder(full_text) if full_text else None
+
+    buyer, supplier = _party(raw.buyer), _party(raw.supplier)
+    if _is_own_company(buyer) and not _is_own_company(supplier):
+        buyer, supplier = supplier, buyer
+        warnings.append("Buyer and supplier swapped (buyer matched OWN_COMPANY_NAMES).")
+
+    header = DocumentHeader(
+        order_number=clean_str(raw.order_number),
+        order_date=parse_date(raw.order_date, lang),
+        requested_delivery_date=parse_date(raw.requested_delivery_date, lang),
+        customer_number=clean_str(raw.customer_number),
+        currency=normalize_currency(raw.currency, raw.gross_total, raw.net_total,
+                                    *(i.unit_price for i in raw.line_items[:3]))
+        or normalize_currency(None, full_text[:4000])
+        or settings.default_currency,
+        language=lang,
+        payment_terms=clean_str(raw.payment_terms),
+        incoterms=clean_str(raw.incoterms),
+    )
+    if raw.order_date and not header.order_date:
+        warnings.append(f"Could not parse order date '{raw.order_date}'.")
+    if raw.requested_delivery_date and not header.requested_delivery_date:
+        warnings.append(f"Could not parse delivery date '{raw.requested_delivery_date}'.")
+
+    net_total = parse_number(raw.net_total, lang)
+    item_lines: list[Optional[list[int]]] = []
+    rows = parse_rows([full_text], lang) if full_text and not raw.line_items else []
+    if raw.line_items or not rows_look_reliable(rows, net_total):
+        # Main path: the LLM's positions (any layout), checked arithmetically
+        items, item_lines = _items_from_llm(raw, lang, header, grounder, warnings)
+        item_source = "llm"
+        reconcile_items_with_net_total(items, net_total, warnings)
+        _drop_stale_mismatch_warnings(items, warnings)
+    else:
+        # Fallback only when the model returned no positions at all: row-wise table parser
+        reconcile_with_net_total(rows, net_total)
+        items = _items_from_rows(rows, raw, header, grounder, warnings)
+        item_lines = [None] * len(items)
+        item_source = "table_rows"
+        warnings.append("The model returned no line items - positions were read by the table row parser.")
+    _drop_repeated_customer_articles(items, header, warnings)
     line_sum = round(sum(i.line_total for i in items if i.line_total is not None), 2) if items else None
     totals = Totals(
         net_amount=parse_number(raw.net_total, lang),
@@ -329,6 +480,7 @@ def normalize_order(raw: RawOrder, lang: Optional[str], full_text: str) -> ErpOr
         line_items=items,
         totals=totals,
         validation=Validation(is_complete=not missing, missing_required_fields=missing, warnings=warnings),
+        meta=Meta(item_source=item_source, item_lines=item_lines),
     )
 
 
@@ -337,10 +489,16 @@ def normalize_order(raw: RawOrder, lang: Optional[str], full_text: str) -> ErpOr
 # ---------------------------------------------------------------------------
 
 
-async def _extract_chunk(chunk: str, info: str, warnings: list[str]) -> RawOrder:
+async def _extract_chunk(chunk: str, info: str, warnings: list[str], stats: dict[str, float]) -> RawOrder:
     parts: dict = {}
     for task, model in (("header", RawHeader), ("items", RawItems)):
         data = await llm.extract(chunk, task, info)
+        for key, value in data.pop("_stats", {}).items():
+            stats[key] = stats.get(key, 0) + value
+        stats["calls"] = stats.get("calls", 0) + 1
+        if data.pop("_truncated", False):
+            warnings.append(f"{info or 'document'} / {task}: LLM output was cut off - "
+                            + ("line items may be missing." if task == "items" else "header fields may be missing."))
         try:
             parts.update(model.model_validate(data).model_dump())
         except ValidationError as exc:
@@ -359,19 +517,26 @@ async def extract_order(
     full_text = pdf.full_text
     lang = detect_language(full_text)
 
-    chunks = chunk_pages(pdf.pages, settings.max_chars_per_chunk) if full_text.strip() else []
+    # The model sees numbered lines ("L12: ...") so it can cite where each position comes from
+    chunks = chunk_pages(pdf.numbered_pages, settings.max_chars_per_chunk) if full_text.strip() else []
     warnings = list(pdf.warnings)
+    stats: dict[str, float] = {}
     raw_results = []
     for i, chunk in enumerate(chunks, start=1):
         info = f"part {i} of {len(chunks)}" if len(chunks) > 1 else ""
-        raw_results.append(await _extract_chunk(chunk, info, warnings))
+        raw_results.append(await _extract_chunk(chunk, info, warnings, stats))
 
+    rereads = 0
     if raw_results:
-        order = normalize_order(merge_raw(raw_results), lang, full_text)
+        merged = merge_raw(raw_results)
+        if merged.line_items:
+            rereads = await reread_failed_items(merged.line_items, pdf.lines, lang, warnings, stats)
+        order = normalize_order(merged, lang, full_text)
     else:
         order = ErpOrder()
         order.validation.missing_required_fields = ["document.order_number", "buyer.name", "line_items"]
     order.validation.warnings = warnings + order.validation.warnings
+    rate = lambda tokens, ms: round(tokens / ms * 1000, 1) if tokens and ms else None  # noqa: E731
     order.meta = Meta(
         source_filename=filename,
         page_count=len(pdf.pages),
@@ -380,6 +545,18 @@ async def extract_order(
         text_chars=len(full_text),
         llm_chunks=len(chunks),
         model=settings.llm_model_name,
-        duration_s=round(time.perf_counter() - t0, 2),
+        duration_s=round(time.perf_counter() - t0 + (pdf.seconds if pdf_text is not None else 0), 2),
+        **(await llm.model_info() if stats else {}),
+        text_extraction_s=pdf.seconds,
+        llm_s=round(stats.get("seconds", 0.0), 2),
+        llm_calls=int(stats.get("calls", 0)),
+        prompt_tokens=int(stats.get("prompt_tokens", 0)),
+        cached_prompt_tokens=int(stats.get("cached_prompt_tokens", 0)),
+        completion_tokens=int(stats.get("completion_tokens", 0)),
+        prompt_tokens_per_s=rate(stats.get("prompt_tokens"), stats.get("prompt_ms")),
+        completion_tokens_per_s=rate(stats.get("completion_tokens"), stats.get("completion_ms")),
+        item_source=order.meta.item_source,
+        item_lines=order.meta.item_lines,
+        items_reread=rereads,
     )
     return order

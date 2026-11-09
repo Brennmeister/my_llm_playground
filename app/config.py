@@ -11,7 +11,8 @@ class Settings(BaseSettings):
     llm_base_url: str = "http://127.0.0.1:8081"
     llm_model_name: str = "qwen3.5-0.8b"  # alias passed to llama-server (--alias)
     llm_timeout_s: float = 300.0
-    llm_max_tokens: int = 2048
+    llm_max_tokens: int = 2048        # header pass
+    llm_max_tokens_items: int = 4096  # line item pass (~80 tokens per row)
     llm_temperature: float = 0.0
     # Context window the server is started with (keep in sync with LLM_CTX in start.sh)
     llm_ctx: int = 8192

@@ -7,9 +7,11 @@ import sqlite3
 import unicodedata
 import uuid
 from contextlib import contextmanager
+from dataclasses import asdict
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, NamedTuple
 
 from .normalize import parse_date, parse_number
 from .pdf_extract import PdfText, PdfWord
@@ -33,9 +35,13 @@ def _connect(db_path: str) -> Iterator[sqlite3.Connection]:
             sources TEXT NOT NULL,
             page_sizes TEXT NOT NULL,
             pdf BLOB NOT NULL,
-            history TEXT NOT NULL
+            history TEXT NOT NULL,
+            page_words TEXT NOT NULL DEFAULT '[]'
         )
     """)
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(reviews)")}
+    if "page_words" not in columns:  # databases created before word persistence
+        connection.execute("ALTER TABLE reviews ADD COLUMN page_words TEXT NOT NULL DEFAULT '[]'")
     try:
         with connection:
             yield connection
@@ -72,68 +78,249 @@ def _all_field_leaves(value: Any, path: str = ""):
         yield path, value
 
 
-def match_sources(order: ErpOrder, pdf: PdfText) -> dict[str, dict[str, Any]]:
-    """Match normalized order values to exact word sequences or equivalent dates/numbers."""
-    sources: dict[str, dict[str, Any]] = {}
-    language = order.document.language
-    for path, value in _field_leaves(order.model_dump(mode="json")):
-        target = _word_tokens(str(value))
-        candidates: dict[tuple[str, ...], tuple[list[PdfWord], float]] = {}
-        if isinstance(value, str):
-            expected_date = parse_date(value, language)
-            expected_number = None
-        elif isinstance(value, (int, float)):
-            expected_date = None
-            expected_number = float(value)
-        else:
-            expected_date = expected_number = None
+def _dump_words(pdf: PdfText) -> str:
+    return json.dumps([[asdict(word) for word in page] for page in pdf.page_words], ensure_ascii=False)
 
+
+def _load_words(raw: str) -> PdfText:
+    return PdfText(page_words=[[PdfWord(**word) for word in page] for page in json.loads(raw)])
+
+
+# Values the pipeline derives or normalizes (unit codes, ISO codes, sums): they often do not
+# appear literally in the PDF, so a missing match is expected and not a review issue.
+_DERIVED = re.compile(
+    r"^(document\.(language|currency)|.*\.country_code|line_items\.\d+\.unit_code|totals\.line_items_sum)$"
+)
+
+
+def _group(path: str) -> str:
+    """Fields that sit together on the page: one party block, or one line item row."""
+    parts = path.split(".")
+    return ".".join(parts[:2]) if parts[0] == "line_items" else parts[0]
+
+
+def _center(words: list[PdfWord]) -> tuple[int, float, float, float]:
+    page = words[0].page
+    x = (min(w.x0 for w in words) + max(w.x1 for w in words)) / 2
+    y0, y1 = min(w.y0 for w in words), max(w.y1 for w in words)
+    return page, x, (y0 + y1) / 2, y1 - y0
+
+
+class Match(NamedTuple):
+    words: list[PdfWord]
+    confidence: float
+    kind: str  # exact | equivalent (same date/number, other format) | approximate (similar text)
+
+
+def _candidates(value: Any, language: str | None, pdf: PdfText) -> list[Match]:
+    target = _word_tokens(str(value))
+    candidates: dict[tuple[str, ...], Match] = {}
+    if isinstance(value, str):
+        expected_date, expected_number = parse_date(value, language), None
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        expected_date, expected_number = None, float(value)
+    else:
+        expected_date = expected_number = None
+
+    for page_words in pdf.page_words:
+        page_tokens = [_word_tokens(word.text) for word in page_words]
+        flat_tokens = [token for tokens in page_tokens for token in tokens]
+        starts: list[tuple[int, int]] = []
+        offset = 0
+        for tokens in page_tokens:
+            starts.append((offset, len(tokens)))
+            offset += len(tokens)
+        if target:
+            for start in range(max(0, len(flat_tokens) - len(target) + 1)):
+                if flat_tokens[start:start + len(target)] == target:
+                    end = start + len(target)
+                    spans = [(word, word_start, word_len) for word, (word_start, word_len) in zip(page_words, starts)
+                             if word_len and word_start < end and word_start + word_len > start]
+                    # a number must cover whole words: position "1" is not the "1" in "1,250.00"
+                    if expected_number is not None and any(ws < start or ws + wl > end for _, ws, wl in spans):
+                        continue
+                    matched = [word for word, _, _ in spans]
+                    candidates[tuple(word.id for word in matched)] = Match(matched, 1.0, "exact")
+
+    if not candidates and (expected_date or expected_number is not None):
         for page_words in pdf.page_words:
-            page_tokens = [_word_tokens(word.text) for word in page_words]
-            flat_tokens = [token for tokens in page_tokens for token in tokens]
-            starts: list[tuple[int, int]] = []
-            offset = 0
-            for tokens in page_tokens:
-                starts.append((offset, len(tokens)))
-                offset += len(tokens)
-            if target:
-                for start in range(max(0, len(flat_tokens) - len(target) + 1)):
-                    if flat_tokens[start:start + len(target)] == target:
-                        matched = [
-                            word for word, (word_start, word_len) in zip(page_words, starts)
-                            if word_len and word_start < start + len(target) and word_start + word_len > start
-                        ]
-                        key = tuple(word.id for word in matched)
-                        candidates[key] = (matched, 1.0)
+            for start in range(len(page_words)):
+                for size in range(1, min(5, len(page_words) - start + 1) + 1):
+                    words = page_words[start:start + size]
+                    phrase = " ".join(word.text for word in words)
+                    if expected_date and parse_date(phrase, language) == expected_date:
+                        candidates[tuple(word.id for word in words)] = Match(words, 0.85, "equivalent")
+                        continue
+                    number = parse_number(phrase, language)
+                    if expected_number is not None and number is not None and abs(number - expected_number) < 0.0001:
+                        candidates[tuple(word.id for word in words)] = Match(words, 0.85, "equivalent")
 
-        if not candidates and (expected_date or expected_number is not None):
-            for page_words in pdf.page_words:
-                for start in range(len(page_words)):
-                    for size in range(1, min(5, len(page_words) - start + 1) + 1):
-                        words = page_words[start:start + size]
-                        phrase = " ".join(word.text for word in words)
-                        if expected_date and parse_date(phrase, language) == expected_date:
-                            candidates[tuple(word.id for word in words)] = (words, 0.85)
-                            continue
-                        number = parse_number(phrase, language)
-                        if expected_number is not None and number is not None and abs(number - expected_number) < 0.0001:
-                            candidates[tuple(word.id for word in words)] = (words, 0.85)
+    if candidates and not any(match.kind == "exact" for match in candidates.values()):
+        shortest = min(len(match.words) for match in candidates.values())
+        candidates = {key: match for key, match in candidates.items() if len(match.words) == shortest}
+    if not candidates and isinstance(value, str):
+        return _approximate_candidates(value, pdf)
+    return list(candidates.values())
 
-        if candidates and not any(confidence == 1.0 for _, confidence in candidates.values()):
-            shortest = min(len(words) for words, _ in candidates.values())
-            candidates = {key: match for key, match in candidates.items() if len(match[0]) == shortest}
-        locations = []
-        found = next(iter(candidates.values())) if len(candidates) == 1 else None
-        if found:
-            words, confidence = found
-            locations = [
-                {"word_id": word.id, "page": word.page, "x0": word.x0, "y0": word.y0, "x1": word.x1, "y1": word.y1}
-                for word in words
-            ]
+
+def _squash(text: str) -> str:
+    return "".join(_word_tokens(text))
+
+
+APPROXIMATE_MIN_RATIO = 0.72
+
+
+def _approximate_candidates(value: str, pdf: PdfText) -> list[Match]:
+    """Locate text the model returned in a slightly different form than the OCR/text layer.
+
+    Typical cases: a description wrapped over two lines ("..._Batterie_H" + "alterung_..."),
+    OCR slips ("Schutzbtigel"), or changed spacing/punctuation. Windows of consecutive words
+    are compared on their squashed text; confidence = similarity ratio (< 1.0 = approximate).
+    """
+    target = _squash(value)
+    if len(target) < 4:
+        return []
+    grams = {target[i:i + 3] for i in range(len(target) - 2)}
+    found: list[tuple[float, list[PdfWord]]] = []
+    for page_words in pdf.page_words:
+        squashed = [_squash(word.text) for word in page_words]
+        for start, first in enumerate(squashed):
+            if not first or not any(first[i:i + 3] in grams for i in range(max(1, len(first) - 2))):
+                continue
+            text = ""
+            for end in range(start, min(len(page_words), start + 60)):
+                text += squashed[end]
+                if len(text) < len(target) * 0.7:
+                    continue
+                if len(text) > len(target) * 1.35:
+                    break
+                matcher = SequenceMatcher(None, target, text, autojunk=False)
+                if matcher.real_quick_ratio() < APPROXIMATE_MIN_RATIO or matcher.quick_ratio() < APPROXIMATE_MIN_RATIO:
+                    continue
+                ratio = matcher.ratio()
+                if ratio >= APPROXIMATE_MIN_RATIO:
+                    found.append((ratio, [w for w, sq in zip(page_words[start:end + 1], squashed[start:end + 1]) if sq]))
+    if not found:
+        return []
+    found.sort(key=lambda item: -item[0])
+    best = found[0][0]
+    results: list[Match] = []
+    used: set[str] = set()
+    for ratio, words in found:  # best non-overlapping windows; near-ties go to the context resolution
+        if ratio < best - 0.03 or any(word.id in used for word in words):
+            continue
+        used.update(word.id for word in words)
+        if ratio >= 0.995:  # identical apart from line breaks/spacing/punctuation
+            results.append(Match(words, 0.95, "exact"))
         else:
-            confidence = 0.0
-        sources[path] = {"extracted_value": value, "confidence": confidence, "locations": locations}
+            results.append(Match(words, round(ratio, 2), "approximate"))
+    return results
+
+
+def _pick_by_context(path: str, options: list[Match], anchors: list[list[PdfWord]]) -> Match | None:
+    """Choose among several occurrences: in the line item's row band, or nearest to the party block."""
+    if not anchors:
+        return None
+    row = path.startswith("line_items.")
+    scored = []
+    for match in options:
+        page, x, y, height = _center(match.words)
+        best = None
+        for anchor in anchors:
+            a_page, a_x, a_y, a_height = _center(anchor)
+            if a_page != page:
+                continue
+            if row:
+                line = max(height, a_height)
+                # same line, or a description line just below the row's values
+                if not (a_y - 0.8 * line <= y <= a_y + 4.5 * line):
+                    continue
+                distance = abs(y - a_y)
+            else:
+                distance = ((x - a_x) ** 2 + (y - a_y) ** 2) ** 0.5
+            best = distance if best is None else min(best, distance)
+        if best is not None:
+            scored.append((best, match))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0])
+    if len(scored) > 1 and abs(scored[0][0] - scored[1][0]) < 1.0:
+        if row and path.endswith(".position"):  # the position is the leftmost column of its row
+            tied = [item for item in scored if abs(item[0] - scored[0][0]) < 1.0]
+            return min(tied, key=lambda item: item[1].words[0].x0)[1]._replace(confidence=0.9)
+        return None  # still ambiguous
+    best_match = scored[0][1]
+    return best_match._replace(confidence=round(best_match.confidence * 0.95, 2))
+
+
+def _reading_order(match: Match) -> tuple[int, float, float]:
+    first = match.words[0]
+    return first.page, round(first.y0), first.x0
+
+
+def match_sources(order: ErpOrder, pdf: PdfText) -> dict[str, dict[str, Any]]:
+    """Match order values to the PDF words: exact text, equivalent dates/numbers, or similar text.
+
+    A value that occurs several times is resolved by its context: line item values must sit in
+    the row band of the item's uniquely matched fields, party values near the party's block.
+    Header/party values that stay ambiguous point to their first occurrence (letterhead).
+    """
+    language = order.document.language
+    leaves = list(_field_leaves(order.model_dump(mode="json")))
+    options = {path: _candidates(value, language, pdf) for path, value in leaves}
+    chosen: dict[str, Match] = {path: found[0] for path, found in options.items() if len(found) == 1}
+    for _ in range(3):  # resolved values become anchors for the rest of their group
+        progress = False
+        for path, found in options.items():
+            if path in chosen or len(found) < 2:
+                continue
+            siblings = {other: match for other, match in chosen.items() if other != path and _group(other) == _group(path)}
+            claimed = {word.id for match in siblings.values() for word in match.words}
+            # words already used by another field of the same row/party are not this field's source
+            free = [match for match in found if not claimed & {word.id for word in match.words}] or found
+            if len(free) == 1 and len(found) > 1 and siblings:
+                chosen[path] = free[0]._replace(confidence=round(free[0].confidence * 0.95, 2))
+                progress = True
+                continue
+            picked = _pick_by_context(path, free, [match.words for match in siblings.values()])
+            if picked:
+                chosen[path] = picked
+                progress = True
+        if not progress:
+            break
+    ambiguous = set()
+    for path, found in options.items():
+        if path not in chosen and len(found) > 1 and not path.startswith("line_items."):
+            first = min(found, key=_reading_order)
+            chosen[path] = first._replace(confidence=round(first.confidence * 0.9, 2))
+            ambiguous.add(path)
+
+    sources: dict[str, dict[str, Any]] = {}
+    for path, value in leaves:
+        match = chosen.get(path)
+        sources[path] = {
+            "extracted_value": value,
+            "confidence": match.confidence if match else 0.0,
+            "match": match.kind if match else None,
+            "approximate": bool(match and match.kind == "approximate"),
+            "ambiguous": path in ambiguous,
+            "occurrences": len(options[path]),
+            "derived": bool(_DERIVED.match(path)),
+            "locations": [
+                {"word_id": word.id, "page": word.page, "x0": word.x0, "y0": word.y0, "x1": word.x1, "y1": word.y1}
+                for word in (match.words if match else [])
+            ],
+        }
     return sources
+
+
+def unmatched_paths(sources: dict[str, dict[str, Any]]) -> list[str]:
+    """Values a reviewer should look at: no (or only an approximate) source location, not yet confirmed."""
+    return [
+        path for path, source in sources.items()
+        if not source.get("confirmed") and not source.get("derived")
+        and (not source["locations"] or source.get("approximate"))
+    ]
 
 
 def create_review(
@@ -145,11 +332,12 @@ def create_review(
     with _connect(db_path) as connection:
         connection.execute(
             """INSERT INTO reviews
-               (id, created_at, updated_at, status, original_order, current_order, sources, page_sizes, pdf, history)
-               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, '[]')""",
+               (id, created_at, updated_at, status, original_order, current_order, sources, page_sizes, pdf, history,
+                page_words)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, '[]', ?)""",
             (
                 review_id, now, now, order_json, order_json, json.dumps(sources, ensure_ascii=False),
-                json.dumps(pdf_text.page_sizes), pdf_bytes,
+                json.dumps(pdf_text.page_sizes), pdf_bytes, _dump_words(pdf_text),
             ),
         )
     return review_id
@@ -173,7 +361,10 @@ def get_review(db_path: str, review_id: str) -> dict[str, Any] | None:
     }
 
 
-def update_review(db_path: str, review_id: str, order: ErpOrder) -> dict[str, Any] | None:
+def update_review(
+    db_path: str, review_id: str, order: ErpOrder, confirmed: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Save corrected values. `confirmed` lists the fields a reviewer explicitly confirmed (Enter)."""
     with _connect(db_path) as connection:
         row = connection.execute("SELECT * FROM reviews WHERE id = ?", (review_id,)).fetchone()
         if row is None:
@@ -191,12 +382,43 @@ def update_review(db_path: str, review_id: str, order: ErpOrder) -> dict[str, An
                 changes.append({"at": datetime.now(timezone.utc).isoformat(), "path": path, "before": before, "after": after})
         old_history = json.loads(row["history"])
         old_history.extend(changes)
+        old_sources = json.loads(row["sources"])
+        sources = _rematch_sources(order, old_sources, row["page_words"])
+        wanted = set(confirmed or [])
+        for path, source in sources.items():
+            source["confirmed"] = path in wanted
+            if source["confirmed"] and not old_sources.get(path, {}).get("confirmed"):
+                old_history.append({"at": datetime.now(timezone.utc).isoformat(), "path": path, "confirmed": source["value"]})
         now = datetime.now(timezone.utc).isoformat()
         connection.execute(
-            "UPDATE reviews SET updated_at = ?, status = 'reviewed', current_order = ?, history = ? WHERE id = ?",
-            (now, json.dumps(updated, ensure_ascii=False), json.dumps(old_history, ensure_ascii=False), review_id),
+            "UPDATE reviews SET updated_at = ?, status = 'reviewed', current_order = ?, history = ?, sources = ? "
+            "WHERE id = ?",
+            (
+                now, json.dumps(updated, ensure_ascii=False), json.dumps(old_history, ensure_ascii=False),
+                json.dumps(sources, ensure_ascii=False), review_id,
+            ),
         )
     return get_review(db_path, review_id)
+
+
+def _rematch_sources(order: ErpOrder, previous: dict[str, Any], raw_words: str) -> dict[str, Any]:
+    """Match the corrected values against the PDF; keep what the model originally extracted."""
+    words = _load_words(raw_words)
+    matched = match_sources(order, words) if words.page_words else {}
+    current = {}
+    for path, value in _field_leaves(order.model_dump(mode="json")):
+        old = previous.get(path)
+        if path in matched:
+            source = matched[path]
+        elif old is not None and old.get("value", old["extracted_value"]) == value:
+            source = dict(old)  # legacy review without stored words: unchanged value keeps its match
+        else:
+            source = {"confidence": 0.0, "locations": []}
+        source["value"] = value
+        source["derived"] = bool(_DERIVED.match(path))
+        source["extracted_value"] = old["extracted_value"] if old is not None else None
+        current[path] = source
+    return current
 
 
 def validate_order(order: ErpOrder) -> ErpOrder:
@@ -222,6 +444,8 @@ def approve_review(db_path: str, review_id: str) -> dict[str, Any] | None:
         row = connection.execute("SELECT * FROM reviews WHERE id = ?", (review_id,)).fetchone()
         if row is None:
             return None
+        if row["status"] == "approved":
+            raise ValueError("This review is already approved.")
         history = json.loads(row["history"])
         history.append({"at": datetime.now(timezone.utc).isoformat(), "status": "approved"})
         now = datetime.now(timezone.utc).isoformat()

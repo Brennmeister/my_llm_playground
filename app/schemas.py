@@ -31,6 +31,10 @@ class RawParty(BaseModel):
 
 
 class RawLineItem(BaseModel):
+    # Source lines first: the model decides WHERE the position is before copying its values,
+    # which keeps all values of one position together (rows can span several lines).
+    first_line: Optional[int] = None
+    last_line: Optional[int] = None
     position: Optional[str] = None
     article_number: Optional[str] = Field(None, description="supplier article/material number")
     customer_article_number: Optional[str] = Field(None, description="buyer's own article number")
@@ -101,8 +105,8 @@ def _inline_and_require_all(schema: dict[str, Any]) -> dict[str, Any]:
     return walk(schema)
 
 
-def llm_json_schema(task: Literal["header", "items"]) -> dict[str, Any]:
-    model = RawHeader if task == "header" else RawItems
+def llm_json_schema(task: Literal["header", "items", "row"]) -> dict[str, Any]:
+    model = {"header": RawHeader, "items": RawItems, "row": RawLineItem}[task]
     schema = _inline_and_require_all(model.model_json_schema())
     if task == "items":
         # Hard cap on items keeps generation time bounded on a notebook
@@ -180,6 +184,22 @@ class Meta(BaseModel):
     llm_chunks: int = 0
     model: Optional[str] = None
     duration_s: float = 0.0
+    # Model and performance details (shown in the review UI)
+    model_file: Optional[str] = None
+    model_params: Optional[str] = None             # e.g. "0.8B"
+    model_size_mb: Optional[float] = None
+    context_size: Optional[int] = None
+    text_extraction_s: float = 0.0                 # text layer + OCR
+    llm_s: float = 0.0
+    llm_calls: int = 0
+    prompt_tokens: int = 0
+    cached_prompt_tokens: int = 0
+    completion_tokens: int = 0
+    prompt_tokens_per_s: Optional[float] = None
+    completion_tokens_per_s: Optional[float] = None
+    item_source: Optional[str] = None              # "llm" (default) or "table_rows" (fallback parser)
+    item_lines: list[Optional[list[int]]] = Field(default_factory=list)  # [first, last] source line per item
+    items_reread: int = 0                          # positions re-read by a focused second LLM call
 
 
 class ErpOrder(BaseModel):

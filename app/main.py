@@ -13,7 +13,9 @@ from . import llm
 from .config import settings
 from .extractor import extract_order
 from .pdf_extract import OcrMode, PdfError, extract_text
-from .review_store import approve_review, create_review, get_review, match_sources, update_review, validate_order
+from .review_store import (
+    approve_review, create_review, get_review, match_sources, unmatched_paths, update_review, validate_order,
+)
 from .schemas import ErpOrder
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -29,6 +31,7 @@ app.mount("/static", StaticFiles(directory=_STATIC), name="static")
 
 class ReviewUpdate(BaseModel):
     order: ErpOrder
+    confirmed: list[str] = []  # field paths the reviewer confirmed (also when unchanged)
 
 
 class ReviewApproval(BaseModel):
@@ -36,8 +39,7 @@ class ReviewApproval(BaseModel):
 
 
 def _review_payload(review: dict) -> dict:
-    unmatched = [path for path, source in review["sources"].items() if not source["locations"]]
-    return {key: value for key, value in review.items() if key != "pdf"} | {"unmatched_fields": unmatched}
+    return {key: value for key, value in review.items() if key != "pdf"} | {"unmatched_fields": unmatched_paths(review["sources"])}
 
 
 async def _read_pdf(file: UploadFile) -> bytes:
@@ -58,6 +60,21 @@ async def root():
 @app.get("/review/{review_id}", include_in_schema=False)
 async def review_page(review_id: str | None = None):
     return FileResponse(_STATIC / "review.html")
+
+
+@app.get("/api/model")
+async def model():
+    """The LLM used for extraction: configured name, what llama-server has loaded, and its status."""
+    status = await llm.health()
+    state = "ready" if status["ok"] else ("loading" if isinstance(status["status"], dict) else "offline")
+    info = await llm.model_info(refresh=True) if state == "ready" else {}
+    return {
+        "name": settings.llm_model_name,
+        "status": state,
+        **info,
+        "max_chars_per_chunk": settings.max_chars_per_chunk,
+        "ocr_languages": settings.ocr_languages,
+    }
 
 
 @app.get("/health")
@@ -122,7 +139,7 @@ async def read_order_review(review_id: str):
 @app.put("/api/reviews/{review_id}")
 async def save_order_review(review_id: str, update: ReviewUpdate):
     try:
-        review = update_review(settings.review_db_path, review_id, validate_order(update.order))
+        review = update_review(settings.review_db_path, review_id, validate_order(update.order), update.confirmed)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     if review is None:
@@ -141,10 +158,12 @@ async def approve_order_review(review_id: str, approval: ReviewApproval):
             "message": "Complete the required fields before approval.",
             "missing_required_fields": order.validation.missing_required_fields,
         })
-    unmatched = [path for path, source in review["sources"].items() if not source["locations"]]
-    if (order.validation.warnings or unmatched) and not approval.acknowledge_warnings:
+    if (order.validation.warnings or unmatched_paths(review["sources"])) and not approval.acknowledge_warnings:
         raise HTTPException(409, "Acknowledge the remaining warnings before approval.")
-    approved = approve_review(settings.review_db_path, review_id)
+    try:
+        approved = approve_review(settings.review_db_path, review_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return _review_payload(approved)
 
 

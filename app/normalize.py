@@ -261,6 +261,7 @@ def clean_str(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
     v = re.sub(r"\s+", " ", str(value)).strip(" ,;:")
+    v = re.sub(r"^L\d{1,4}:\s*", "", v)  # line number prefix copied by the model
     return v if v and v.lower() not in ("null", "none", "n/a", "-", "--") else None
 
 

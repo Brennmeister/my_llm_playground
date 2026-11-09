@@ -74,7 +74,9 @@ def test_sanitize_removes_hallucinations():
                    supplier=RawParty(company_name="Lieferant GmbH"),
                    delivery_address=RawParty(company_name="Lieferant GmbH"))
     order = normalize_order(raw, "de", text)
-    assert order.document.order_number is None
+    # the hallucinated PO-9 is removed; the real number is recovered from its label
+    assert any("PO-9" in w for w in order.validation.warnings)
+    assert order.document.order_number == "PO-1"
     assert order.buyer.contact.phone is None and order.buyer.contact.email is None
     assert (order.buyer.postal_code, order.buyer.city, order.buyer.country_code) == ("80331", "München", "DE")
     assert order.ship_to.name == "Beispiel AG"
