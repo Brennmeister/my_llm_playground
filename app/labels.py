@@ -37,7 +37,21 @@ DELIVERY_DATE = _labels(
 CUSTOMER_NUMBER = _labels(
     r"kunden[\s-]*(?:nummer|nr)", r"kd\.?[\s-]*nr", r"customer\s+(?:number|no|id)", r"account\s+(?:number|no)",
     r"(?:nr|numer)\s+klienta", r"(?:codice|cod\.?)\s+cliente",
+    # the buyer prints the supplier's number in its system - that is the account the order belongs to
+    r"(?:ihre\s+)?kreditoren[\s-]*(?:nummer|nr)", r"(?:ihre\s+)?lieferanten[\s-]*(?:nummer|nr)(?:\s+bei\s+uns)?",
+    r"(?:vendor|supplier)\s+(?:number|no|id)", r"(?:nr|numer)\s+dostawcy", r"(?:codice|cod\.?)\s+fornitore",
 )
+NET_TOTAL = _labels(
+    r"(?:total|summe|gesamt)\s+netto", r"netto\s*(?:summe|betrag|gesamt|wert)", r"gesamtnettowert(?:\s+ohne\s+mwst)?",
+    r"nettobetrag", r"warenwert", r"net\s+(?:total|amount)", r"subtotal", r"total\s+net",
+    r"warto[sś][cć]\s+netto", r"razem\s+netto", r"(?:totale\s+)?imponibile",
+)
+GROSS_TOTAL = _labels(
+    r"endbetrag(?:\s+brutto)?", r"gesamtbetrag", r"bruttobetrag", r"(?:total|summe|gesamt)\s+brutto",
+    r"grand\s+total", r"total\s+(?:amount|due)", r"amount\s+due", r"do\s+zap[lł]aty", r"warto[sś][cć]\s+brutto",
+    r"totale\s+(?:documento|fattura|ordine)",
+)
+_MONEY_VALUE = re.compile(r"-?\d{1,3}(?:[.,' ]\d{3})*[.,]\d{2}(?!\d)|-?\d+[.,]\d{2}(?!\d)")
 # Generic date labels must not steal the delivery date ("Delivery date", "Data di consegna")
 _DELIVERY_BEFORE = re.compile(r"(liefer|deliver|consegna|dostaw|termin|due|required|wunsch)\w*\W*$", re.I)
 _DELIVERY_AFTER = re.compile(r"^(di\s+|della\s+)?(consegna|dostawy|delivery)", re.I)
@@ -78,8 +92,8 @@ def _candidates(text: str, label: re.Pattern[str], skip_delivery: bool, next_lin
             rest = line[match.end():].strip()
             if skip_delivery and (_DELIVERY_BEFORE.search(line[:match.start()][-25:]) or _DELIVERY_AFTER.match(rest)):
                 continue
-            if not rest and index + 1 < len(lines) and next_line(match.group(0)):
-                rest = lines[index + 1].strip()
+            if not re.search(r"\d", rest) and index + 1 < len(lines) and next_line(match.group(0)):
+                rest = f"{rest} {lines[index + 1].strip()}".strip()  # value on the next line
             if rest:
                 yield rest[:60]
 
@@ -134,3 +148,16 @@ def dates_in_text(text: str, lang: Optional[str]) -> set[str]:
         if iso:
             found.add(iso)
     return found
+
+
+def _pick_amount(rest: str) -> Optional[str]:
+    match = _MONEY_VALUE.search(rest[:40])
+    return match.group(0) if match else None
+
+
+def find_net_total(text: str) -> Optional[str]:
+    return _first(text, NET_TOTAL, _pick_amount)
+
+
+def find_gross_total(text: str) -> Optional[str]:
+    return _first(text, GROSS_TOTAL, _pick_amount)

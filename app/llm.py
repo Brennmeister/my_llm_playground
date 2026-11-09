@@ -70,11 +70,15 @@ For each position:
 - line_total: Gesamt, Gesamtpreis, Nettowert, Betrag, Amount, Wartość, Importo
 - delivery_date: only if the POSITION has its own delivery date, else null.
 Do NOT include header rows, notes, subtotal, tax, shipping or total rows.""",
-    "row": """TASK: The excerpt above contains the table header and ONE order position (plus maybe parts of
-its neighbours). Extract exactly the position that starts at the line given below, with all of its values.
+    "row": """TASK: The excerpt above contains the table header and the lines of ONE order position (maybe with a
+neighbouring line). Extract exactly the position whose quantity / price are on the line given below, with all
+of its values, and set first_line / last_line to the lines that belong to it.
 Every line starts with its number ("L12: "); these numbers are NOT part of any value. The position can span
 several lines (values on one line, article number / description on the next). Use the table header to know
-which column is which. Copy values exactly as written; null if a value is not written for THIS position.""",
+which column is which. Copy values exactly as written; null if a value is not written for THIS position.
+- article_number: the supplier's article / material number from the article or material column. NOT a
+  reference (Referenz, Ref., Ihre Bestellung, Kontrakt), NOT the position number, NOT a quantity.
+- description: the article name / text; quantity, unit, unit_price, line_total: from this position only.""",
 }
 
 

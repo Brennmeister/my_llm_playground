@@ -148,9 +148,8 @@ the persistent `review-data` volume; native runs use `data/order_reviews.sqlite3
   every conversion: number formats such as `1.234,56`, `1,234.56`, `1 234,56 zł`; dates in 4
   languages including month names and calendar weeks; units mapped to UN/ECE codes; currencies;
   country codes.
-- **Two short passes instead of one large one.** Pass 1 extracts the header, parties and totals.
-  Pass 2 extracts the line items. The document text comes first in the prompt, so pass 2 reuses
-  pass 1's KV cache (prompt caching).
+- **Short, focused calls instead of one large one.** One call extracts the header, parties and totals
+  from the whole document; then every position is read in its own short call.
 - **Grammar-constrained JSON** (`response_format: json_schema`). The model cannot produce invalid
   JSON. All keys are required and may be null, so the model has to consider every field.
 - **Thinking mode is off** (`enable_thinking: false`). This saves tokens and time.
@@ -163,13 +162,18 @@ the persistent `review-data` volume; native runs use `data/order_reviews.sqlite3
   - Summary rows (Summe, Versand, Total, Razem, Totale, ...) returned as line items are dropped;
     item descriptions that don't occur in the PDF are flagged.
 - **The LLM reads the positions, the code checks them:** the model sees the document with numbered
-  lines (`L12: ...`) and returns every position with the lines it comes from, so any table layout works
-  (one line per position, values and article on separate lines, ...). A layout-agnostic check verifies
-  that quantity, price, total and article number really occur in those lines and that
-  quantity x price = total; failing positions get a focused second LLM call on just their lines plus
-  the table header. The printed net total is used as a numeric cross-check for misread amounts. Every
-  correction is listed as a warning. A deterministic row parser (`app/table_rows.py`) is only a fallback
-  when the model returns no positions at all.
+  lines (`L12: ...`). The code only finds the candidate position lines - a quantity with a unit followed
+  by amounts (`150 Stück 9,85 1.477,50`), a pattern almost every order table shares, whatever the column
+  order. The model then reads **each position in its own short call** (table header + that position's
+  lines), so it interprets the columns, article numbers, descriptions and multi-line rows of any layout,
+  and values cannot slip into a neighbouring position. Without such lines the model reads the whole table
+  in one call.
+- **Verification instead of trust:** a model value is kept when it occurs in the position's lines and
+  quantity x price = total holds. Otherwise the reading of the position line (cross-checked with the
+  printed net total, which also repairs OCR slips such as a lost decimal comma) replaces it; article
+  numbers that are empty, a quantity or a copy of the description, and descriptions that are not in the
+  position lines are fixed the same way, and positions that still fail get a second, focused LLM call.
+  Every change is listed as a warning, and the review UI shows the cited lines for corrected values.
 - **Label fallback for key header fields:** order number, order date, delivery date and customer
   number are also looked up next to their printed labels (DE/EN/PL/IT). This fills fields the model
   missed and fixes the common "customer number returned as order number" mix-up.
@@ -231,8 +235,8 @@ app/
   static/          Browser review UI, SVG source highlights, and locally bundled PDF.js
   extractor.py     pipeline: chunks -> 2 LLM passes -> merge -> sanity checks -> ERP model
   labels.py        deterministic label lookup for order/customer number and dates
-  verify.py        row check of the LLM's positions, focused re-read, net total cross-check
-  table_rows.py    fallback line item parser for row-wise tables (only if the LLM finds none)
+  verify.py        position lines, per-position LLM reading, verification, focused re-read
+  table_rows.py    position line reading and OCR amount repair (used by verify.py)
   llm.py           llama-server client, prompts (multilingual label hints)
   pdf_extract.py   PyMuPDF text extraction, Tesseract OCR, chunking
   normalize.py     locale-aware numbers/dates, units, currencies, countries, grounding

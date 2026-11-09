@@ -58,3 +58,31 @@ def test_net_total_fixes_one_misread_total():
     warnings = []
     reconcile_items_with_net_total(items, 1113.5, warnings)
     assert items[1].line_total == 757.5 and warnings
+
+
+def test_position_lines_are_found_whatever_the_column_order():
+    from app.verify import anchor_segments
+
+    lines = {1: "Pos Material Menge Preis Wert", 2: "00010 150 Stück 9,85 1.477,50", 3: "2145723 HALTEWINKEL",
+             4: "Referenz: X_1", 5: "20 4711 Schraube M8 40 Stk 0,10 4,00", 6: "Summe netto 1.481,50"}
+    assert [(first, last, position) for first, last, position, _ in anchor_segments(lines, "de")] == [
+        (2, 3, "10"), (5, 5, "20")]
+
+
+def test_model_values_are_kept_when_they_are_in_the_lines_and_add_up():
+    from app.table_rows import _parse_anchor
+    from app.verify import fix_position_number, harmonize_with_line
+
+    segment = ["50 1128035 160 Stk 14,50 / 2.320,00", "TEIL_Halterung_Logger"]
+    row = _parse_anchor(segment[0], "de")
+    good = RawLineItem(first_line=32, last_line=33, position="50", article_number="1128035", description="TEIL_Halterung_Logger",
+                       quantity="160", unit="Stk", unit_price="14,50", line_total="2.320,00")
+    warnings = []
+    harmonize_with_line(good, row, segment, "de", warnings)
+    assert warnings == [] and good.quantity == "160"
+    # the model took the position number as quantity and invented a total, copied the line number as position
+    bad = good.model_copy(update={"position": "32", "quantity": "50", "line_total": "725,00", "article_number": "TEIL_Halterung_Logger"})
+    fix_position_number(bad, "50", segment[0])
+    harmonize_with_line(bad, row, segment, "de", warnings)
+    assert (bad.position, bad.quantity, bad.line_total, bad.article_number) == ("50", "160", "2320", "1128035")
+    assert warnings and "quantity 50 -> 160" in warnings[0]

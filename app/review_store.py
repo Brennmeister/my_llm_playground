@@ -185,7 +185,7 @@ def _approximate_candidates(value: str, pdf: PdfText) -> list[Match]:
     for page_words in pdf.page_words:
         squashed = [_squash(word.text) for word in page_words]
         for start, first in enumerate(squashed):
-            if not first or not any(first[i:i + 3] in grams for i in range(max(1, len(first) - 2))):
+            if not first or not (first in target or any(first[i:i + 3] in grams for i in range(max(1, len(first) - 2)))):
                 continue
             text = ""
             for end in range(start, min(len(page_words), start + 60)):
@@ -268,6 +268,12 @@ def match_sources(order: ErpOrder, pdf: PdfText) -> dict[str, dict[str, Any]]:
     language = order.document.language
     leaves = list(_field_leaves(order.model_dump(mode="json")))
     options = {path: _candidates(value, language, pdf) for path, value in leaves}
+    spans = _item_spans(order)
+    for path, found in options.items():
+        span = spans.get(_group(path))
+        if span and found:  # the model cited the lines of this position: prefer matches inside them
+            inside = [m for m in found if all(span[0] <= word.line <= span[1] for word in m.words)]
+            options[path] = inside or found
     chosen: dict[str, Match] = {path: found[0] for path, found in options.items() if len(found) == 1}
     for _ in range(3):  # resolved values become anchors for the rest of their group
         progress = False
@@ -306,12 +312,37 @@ def match_sources(order: ErpOrder, pdf: PdfText) -> dict[str, dict[str, Any]]:
             "ambiguous": path in ambiguous,
             "occurrences": len(options[path]),
             "derived": bool(_DERIVED.match(path)),
+            "lines": spans.get(_group(path)),
+            "row_locations": _row_boxes(pdf, spans.get(_group(path))) if not match else [],
             "locations": [
                 {"word_id": word.id, "page": word.page, "x0": word.x0, "y0": word.y0, "x1": word.x1, "y1": word.y1}
                 for word in (match.words if match else [])
             ],
         }
     return sources
+
+
+def _item_spans(order: ErpOrder) -> dict[str, tuple[int, int]]:
+    """line_items.N -> (first, last) document line the model cited for that position."""
+    spans = {}
+    for index, span in enumerate(order.meta.item_lines):
+        if span and span[0]:
+            spans[f"line_items.{index}"] = (span[0], span[-1] or span[0])
+    return spans
+
+
+def _row_boxes(pdf: PdfText, span: tuple[int, int] | None) -> list[dict[str, Any]]:
+    """One box per cited line - shown when a value is not printed literally (e.g. a corrected amount)."""
+    if not span:
+        return []
+    boxes: dict[int, dict[str, Any]] = {}
+    for page_words in pdf.page_words:
+        for word in page_words:
+            if span[0] <= word.line <= span[1]:
+                box = boxes.setdefault(word.line, {"page": word.page, "x0": word.x0, "y0": word.y0, "x1": word.x1, "y1": word.y1})
+                box["x0"], box["y0"] = min(box["x0"], word.x0), min(box["y0"], word.y0)
+                box["x1"], box["y1"] = max(box["x1"], word.x1), max(box["y1"], word.y1)
+    return [boxes[line] | {"word_id": f"line-{line}"} for line in sorted(boxes)]
 
 
 def unmatched_paths(sources: dict[str, dict[str, Any]]) -> list[str]:

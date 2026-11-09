@@ -24,7 +24,9 @@ from .normalize import (
 )
 from .pdf_extract import OcrMode, PdfText, chunk_pages, extract_text
 from .table_rows import TableRow, parse_rows, reconcile_with_net_total, rows_look_reliable
-from .verify import arithmetic_ok, reconcile_items_with_net_total, reread_failed_items
+from .table_rows import _repair_amounts as _repair_row_amounts
+from .verify import _numbers as numbers_in_text
+from .verify import anchor_segments, arithmetic_ok, extract_positions, fix_position_number, harmonize_with_line, reconcile_items_with_net_total, reread_failed_items
 from .schemas import (
     Contact,
     DocumentHeader,
@@ -245,6 +247,18 @@ def apply_label_fallbacks(raw: RawOrder, text: str, lang: Optional[str], warning
         if value and printed_dates and iso not in printed_dates:
             warnings.append(f"{field} '{value}' does not occur in the document - removed.")
             setattr(raw, field, None)
+    printed_numbers = numbers_in_text(text, lang)
+    for field in ("net_total", "tax_amount", "gross_total"):
+        value = parse_number(getattr(raw, field), lang)
+        if value is not None and not any(abs(value - n) < 0.005 for n in printed_numbers):
+            warnings.append(f"{field} '{getattr(raw, field)}' does not occur in the document - removed.")
+            setattr(raw, field, None)
+    for field, finder in (("net_total", labels.find_net_total), ("gross_total", labels.find_gross_total)):
+        if not clean_str(getattr(raw, field)):
+            found_amount = finder(text)
+            if found_amount:
+                log.info("%s filled from document label: %r", field, found_amount)
+                setattr(raw, field, found_amount)
     order_number = labels.find_order_number(text)
     customer_number = labels.find_customer_number(text)
     # Typical small-model mix-up: the customer number is returned as the order number
@@ -489,21 +503,42 @@ def normalize_order(raw: RawOrder, lang: Optional[str], full_text: str) -> ErpOr
 # ---------------------------------------------------------------------------
 
 
-async def _extract_chunk(chunk: str, info: str, warnings: list[str], stats: dict[str, float]) -> RawOrder:
-    parts: dict = {}
-    for task, model in (("header", RawHeader), ("items", RawItems)):
-        data = await llm.extract(chunk, task, info)
-        for key, value in data.pop("_stats", {}).items():
-            stats[key] = stats.get(key, 0) + value
-        stats["calls"] = stats.get("calls", 0) + 1
-        if data.pop("_truncated", False):
-            warnings.append(f"{info or 'document'} / {task}: LLM output was cut off - "
-                            + ("line items may be missing." if task == "items" else "header fields may be missing."))
+async def _llm_pass(chunk: str, task: str, info: str, warnings: list[str], stats: dict[str, float]) -> dict:
+    data = await llm.extract(chunk, task, info)
+    for key, value in data.pop("_stats", {}).items():
+        stats[key] = stats.get(key, 0) + value
+    stats["calls"] = stats.get("calls", 0) + 1
+    if data.pop("_truncated", False):
+        warnings.append(f"{info or 'document'} / {task}: LLM output was cut off - "
+                        + ("line items may be missing." if task != "header" else "header fields may be missing."))
+    return data
+
+
+async def _extract_header(chunk: str, info: str, warnings: list[str], stats: dict[str, float]) -> RawOrder:
+    try:
+        return RawOrder.model_validate(RawHeader.model_validate(await _llm_pass(chunk, "header", info, warnings, stats)).model_dump())
+    except ValidationError as exc:
+        warnings.append(f"{info or 'document'} / header: LLM output did not match schema ({exc.error_count()} errors).")
+        return RawOrder()
+
+
+def _check_against_lines(items: list[RawLineItem], segments, lines: dict[int, str], lang: Optional[str],
+                         warnings: list[str]) -> None:
+    for item, (first, last, printed, row) in zip(items, segments):
+        fix_position_number(item, printed, lines.get(first, ""))
+        harmonize_with_line(item, row, [lines[n] for n in range(first, last + 1) if n in lines], lang, warnings)
+
+
+async def _extract_items_whole(chunks: list[str], warnings: list[str], stats: dict[str, float]) -> list[RawLineItem]:
+    """All positions in one LLM call per chunk - for tables without recognizable position lines."""
+    items: list[RawLineItem] = []
+    for i, chunk in enumerate(chunks, start=1):
+        info = f"part {i} of {len(chunks)}" if len(chunks) > 1 else ""
         try:
-            parts.update(model.model_validate(data).model_dump())
+            items += RawItems.model_validate(await _llm_pass(chunk, "items", info, warnings, stats)).line_items
         except ValidationError as exc:
-            warnings.append(f"{info or 'document'} / {task}: LLM output did not match schema ({exc.error_count()} errors).")
-    return RawOrder.model_validate(parts)
+            warnings.append(f"{info or 'document'} / items: LLM output did not match schema ({exc.error_count()} errors).")
+    return items
 
 
 async def extract_order(
@@ -524,13 +559,28 @@ async def extract_order(
     raw_results = []
     for i, chunk in enumerate(chunks, start=1):
         info = f"part {i} of {len(chunks)}" if len(chunks) > 1 else ""
-        raw_results.append(await _extract_chunk(chunk, info, warnings, stats))
+        raw_results.append(await _extract_header(chunk, info, warnings, stats))
 
     rereads = 0
     if raw_results:
         merged = merge_raw(raw_results)
-        if merged.line_items:
-            rereads = await reread_failed_items(merged.line_items, pdf.lines, lang, warnings, stats)
+        lines = pdf.lines
+        segments = anchor_segments(lines, lang)
+        if segments:
+            # line readings of the position lines, cross-checked with the printed net total (OCR repair)
+            net = parse_number(merged.net_total, lang) or parse_number(labels.find_net_total(full_text), lang)
+            rows = [segment[3] for segment in segments]
+            for row in rows:
+                _repair_row_amounts(row)
+            reconcile_with_net_total(rows, net)
+            # one focused LLM call per position: values cannot slip into a neighbouring position
+            merged.line_items = await extract_positions(segments, lines, stats)
+            rereads = await reread_failed_items(merged.line_items, lines, lang, warnings, stats)
+            _check_against_lines(merged.line_items, segments, lines, lang, warnings)
+        else:
+            merged.line_items = await _extract_items_whole(chunks, warnings, stats)
+            if merged.line_items:
+                rereads = await reread_failed_items(merged.line_items, lines, lang, warnings, stats)
         order = normalize_order(merged, lang, full_text)
     else:
         order = ErpOrder()

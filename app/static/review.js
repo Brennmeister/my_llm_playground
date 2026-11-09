@@ -302,6 +302,7 @@ function addLineItem() {
 }
 function removeLineItem(index) {
   review.order.line_items.splice(index, 1);
+  review.order.meta?.item_lines?.splice(index, 1);
   savedOrder.line_items.splice(index, 1);
   const sources = {};
   for (const [path, source] of Object.entries(review.sources)) {
@@ -396,6 +397,13 @@ async function selectField(path, { scroll = true } = {}) {
   const state = fieldState(path);
   const source = review.sources[path];
   if (state === "edited") { setHint("Changed value — save to locate it in the PDF"); return; }
+  if (!source?.locations?.length && source?.row_locations?.length) {
+    const note = rowContext(path)?.note;
+    const [first, last] = source.lines ?? [];
+    setHint(`${labelFor(path)}: ${note ?? "not printed like this"} — read by the model from line${first === last ? ` L${first}` : `s L${first}–L${last}`}`);
+    await highlightPath(path, source.row_locations[0].page - 1, true);
+    return;
+  }
   if (!source?.locations?.length) {
     const row = rowContext(path);
     if (row) {
@@ -542,7 +550,8 @@ function drawHighlights(page) {
   const pad = 2;
   svg.replaceChildren();
   for (const [path, source] of Object.entries(review.sources)) {
-    for (const location of source.locations ?? []) {
+    const context = !source.locations?.length && source.row_locations?.length;
+    for (const location of context ? source.row_locations : source.locations ?? []) {
       if (location.page !== pageNumber) continue;
       const rect = document.createElementNS(NS, "rect");
       rect.setAttribute("x", location.x0 * scaleX - pad);
@@ -552,6 +561,7 @@ function drawHighlights(page) {
       rect.setAttribute("rx", 3);
       rect.classList.add("source-rect");
       if (source.approximate) rect.classList.add("approx");
+      if (context) rect.classList.add("row-context");
       if (path === selectedPath) rect.classList.add("active");
       rect.dataset.path = path;
       const title = document.createElementNS(NS, "title");
@@ -641,7 +651,8 @@ function renderRunInfo() {
     ["Prompt", `${number(meta.prompt_tokens)} tokens${meta.cached_prompt_tokens ? ` (+${number(meta.cached_prompt_tokens)} cached)` : ""}`
       + (meta.prompt_tokens_per_s ? ` · ${meta.prompt_tokens_per_s} tok/s` : "")],
     ["Generated", `${number(meta.completion_tokens)} tokens` + (meta.completion_tokens_per_s ? ` · ${meta.completion_tokens_per_s} tok/s` : "")],
-    ["Line items from", { table_rows: "table row parser (LLM fills gaps)", llm: "LLM" }[meta.item_source] ?? null],
+    ["Line items from", meta.item_source === "table_rows" ? "table row parser (model found no positions)"
+      : `LLM, one call per position${meta.items_reread ? ` · ${meta.items_reread} re-read` : ""}`],
     ["Text size", `${number(meta.text_chars)} characters`],
   ];
   const list = $("#run-details");

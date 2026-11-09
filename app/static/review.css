@@ -73,6 +73,8 @@ body.reviewing{height:100vh;height:100dvh;overflow:hidden}
 .source-rect{fill:#ffd54a;fill-opacity:0;stroke:none;cursor:pointer;pointer-events:all;transition:fill-opacity .15s}
 .source-rect:hover{fill-opacity:.18}
 .source-rect.active{fill-opacity:.34;stroke:#e2a400;stroke-width:1;stroke-opacity:.8}
+.source-rect.row-context{pointer-events:none}
+.source-rect.row-context.active{fill:#8fb7ef;fill-opacity:.16;stroke:#5b8fd6;stroke-dasharray:3 3;stroke-width:1}
 .source-rect.approx.active{stroke-dasharray:4 3;stroke-width:1.4}
 .source-rect.pulse{animation:locate 1.1s ease-out}
 @keyframes locate{0%{fill-opacity:.75;stroke-width:4}100%{fill-opacity:.34;stroke-width:1}}
