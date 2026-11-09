@@ -142,6 +142,27 @@ Review sessions, original PDFs, and correction history are stored locally in SQL
 the persistent `review-data` volume; native runs use `data/order_reviews.sqlite3` (override with
 `REVIEW_DB_PATH`). The browser viewer assets are served by FastAPI from `/static/vendor/pdfjs/`.
 
+## The model reads text AND sees the document
+
+Qwen3.5 is a vision-language model. Every LLM call gets the document text (text layer, or OCR for
+scans) **and** the image of the same place:
+
+- the header call sees the pages of its chunk (scaled to `LLM_PAGE_IMAGE_TOKENS` in total, so long
+  documents still fit the context), the call for one position sees the strip of the page with that
+  position's rows - including the space below it, where corrections are usually written. Positions that
+  continue on the next page get a strip of each page; multi-page orders work the same way.
+- The text gives exact characters and the word positions for the review highlights; the image gives
+  what text loses: faint or gray print, OCR misreadings (`2806` for a faint `28,70`), stamps and
+  handwriting. On scanned pages a value the model read from the image is kept when it adds up
+  (quantity x price = total), even if the OCR text shows something else.
+- **Handwriting wins over print, with a warning.** The model lists values that were crossed out,
+  overwritten or added by hand (`field`, printed value, handwritten value). The printed value is verified
+  first like any other value; then the handwritten one replaces it, the line total is recalculated from a
+  handwritten price or quantity, and every such field is marked "handwritten" in the review and must be
+  confirmed. Claims of handwriting are ignored on pages without image content (a digital PDF without
+  scans, images or ink annotations) and when the "handwritten" value is just the printed one.
+- `LLM_IMAGES=all|scans|off` controls it. A row strip costs ~200 prompt tokens and a few seconds.
+
 ## How it handles a 0.8B model on a notebook
 
 - **The model only copies text.** It returns values exactly as they appear in the PDF. Python does
@@ -200,6 +221,9 @@ Copy `.env.example` to `.env`. `install.sh` does this for you. Environment varia
 | `MAX_CHARS_PER_CHUNK` | `9000` | PDF text per LLM call |
 | `LLM_MAX_TOKENS_ITEMS` | `4096` | Output budget of the line item pass (~80 tokens per row) |
 | `OCR_LANGUAGES` | `deu+eng+pol+ita` | Tesseract languages |
+| `MMPROJ_FILE` | `mmproj-BF16.gguf` | Vision projector of the model repo (native setup; Docker loads it automatically). Empty = text only |
+| `LLM_IMAGES` | `all` | Images sent to the model: `all` pages, only `scans`, or `off` |
+| `LLM_PAGE_IMAGE_TOKENS` | `1500` | Image token budget of a header call (shared by the pages of a chunk) |
 
 ### Choosing the model
 
@@ -239,6 +263,7 @@ app/
   table_rows.py    position line reading and OCR amount repair (used by verify.py)
   llm.py           llama-server client, prompts (multilingual label hints)
   pdf_extract.py   PyMuPDF text extraction, Tesseract OCR, chunking
+  images.py        page and row images for the model (token-budgeted), pages with image content
   normalize.py     locale-aware numbers/dates, units, currencies, countries, grounding
   schemas.py       raw LLM schema and ERP output schema
   config.py        settings (.env)

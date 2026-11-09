@@ -8,6 +8,7 @@ pass reuses the KV cache of the first one (prompt caching) and costs almost noth
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import re
@@ -31,7 +32,20 @@ SYSTEM_PROMPT = """You extract purchase order data from business documents for E
 Documents are in German, English, Polish or Italian. Reply ONLY with JSON matching the schema.
 Copy values EXACTLY as written in the document (numbers, dates, units, codes). Do not translate or calculate.
 If a value is not written in the document, use null. NEVER invent or guess values.
-Lines are prefixed with their number ("L12: "); never copy these prefixes into values."""
+Lines are prefixed with their number ("L12: "); never copy these prefixes into values.
+You may also get IMAGES of the document. The text was read from the same document (text layer or OCR) and
+gives the exact characters; OCR text can contain errors - then read the value from the image.
+Faint or gray print that is missing in the text can be read from the image.
+HANDWRITING: if a printed value is crossed out or overwritten by hand, or a value is added by hand, the
+HANDWRITTEN value is the valid one: put it into the field and list it in "handwritten" (field, printed value,
+handwritten value). Only list what you clearly see written by hand in the image; else "handwritten" is []."""
+
+HANDWRITING_HEADER = """- handwritten: ONLY header values that are crossed out / overwritten / added BY HAND in the image.
+  Printed values are never listed there. Usually []."""
+
+HANDWRITING_ROW = """- handwritten: ONLY values of THIS position changed BY HAND in the image (a crossed-out price with a new
+  one written next to it, a corrected quantity, ...); printed values are never listed there. Usually [].
+- discount: only if a discount is printed for this position, else null."""
 
 TASKS: dict[str, str] = {
     "header": """TASK: Extract the order header, the parties and the totals. Ignore the article lines.
@@ -49,7 +63,8 @@ TASKS: dict[str, str] = {
 - incoterms: Incoterms / Lieferbedingung / Resa, e.g. "DAP München", "FCA Leeds", "EXW"
 - net_total: Summe netto, Nettobetrag, Net total, Subtotal, Wartość netto, Imponibile
 - tax_rate / tax_amount: MwSt., USt., VAT, Podatek VAT, IVA
-- gross_total: Gesamtbetrag, Bruttobetrag, Total, Wartość brutto, Totale""",
+- gross_total: Gesamtbetrag, Bruttobetrag, Total, Wartość brutto, Totale
+""" + HANDWRITING_HEADER,
     "items": """TASK: Extract every ordered position (article lines of the order table) as line_items. Ignore everything else.
 
 Every document line starts with its number, e.g. "L12: ". These numbers are NOT part of any value.
@@ -69,7 +84,8 @@ For each position:
 - discount: Rabatt, Discount, Rabat, Sconto (null if none)
 - line_total: Gesamt, Gesamtpreis, Nettowert, Betrag, Amount, Wartość, Importo
 - delivery_date: only if the POSITION has its own delivery date, else null.
-Do NOT include header rows, notes, subtotal, tax, shipping or total rows.""",
+Do NOT include header rows, notes, subtotal, tax, shipping or total rows.
+""" + HANDWRITING_ROW,
     "row": """TASK: The excerpt above contains the table header and the lines of ONE order position (maybe with a
 neighbouring line). Extract exactly the position whose quantity / price are on the line given below, with all
 of its values, and set first_line / last_line to the lines that belong to it.
@@ -78,7 +94,11 @@ several lines (values on one line, article number / description on the next). Us
 which column is which. Copy values exactly as written; null if a value is not written for THIS position.
 - article_number: the supplier's article / material number from the article or material column. NOT a
   reference (Referenz, Ref., Ihre Bestellung, Kontrakt), NOT the position number, NOT a quantity.
-- description: the article name / text; quantity, unit, unit_price, line_total: from this position only.""",
+- description: the article name / text; quantity, unit, unit_price, line_total: from this position only.
+The image shows the strip of the page with this position: use it to read values the text got wrong.
+If a printed value of this position is crossed out and a new value is written by hand (below or next to
+it), the handwritten value goes into the field and into "handwritten".
+""" + HANDWRITING_ROW,
 }
 
 
@@ -107,13 +127,23 @@ async def health() -> dict[str, Any]:
         return {"ok": False, "status": str(exc)}
 
 
-async def extract(document_text: str, task: Task, chunk_info: str = "", instruction: str = "") -> dict[str, Any]:
+async def extract(document_text: str, task: Task, chunk_info: str = "", instruction: str = "",
+                  images: list[bytes] | None = None) -> dict[str, Any]:
     doc_part = f"<document{(' ' + chunk_info) if chunk_info else ''}>\n{document_text}\n</document>\n\n"
+    text = doc_part + TASKS[task] + (f"\n{instruction}" if instruction else "")
+    user: Any = text
+    if images:
+        intro = ("Images of the pages of this document part:" if task != "row"
+                 else "Image of the page strip with this position:")
+        user = [{"type": "text", "text": intro}]
+        user += [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(png).decode()}}
+                 for png in images]
+        user.append({"type": "text", "text": text})
     payload = {
         "model": settings.llm_model_name,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": doc_part + TASKS[task] + (f"\n{instruction}" if instruction else "")},
+            {"role": "user", "content": user},
         ],
         "temperature": settings.llm_temperature,
         "top_p": 1.0,
@@ -156,6 +186,45 @@ async def extract(document_text: str, task: Task, chunk_info: str = "", instruct
     data["_truncated"] = truncated
     data["_stats"] = _call_stats(body, elapsed)
     return data
+
+
+_CROSSED_SCHEMA = {"type": "object", "properties": {"crossed_out": {"type": "boolean"}},
+                   "required": ["crossed_out"], "additionalProperties": False}
+
+
+async def crossed_out(image: bytes, value: str) -> tuple[bool, dict[str, float]]:
+    """One yes/no question about one printed value in a row image: is it struck through by hand?
+
+    A small model that read a row is not reliable at telling a handwritten correction from a note or
+    a check mark next to a value; asked about one value, it is."""
+    payload = {
+        "model": settings.llm_model_name,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(image).decode()}},
+            {"type": "text", "text": f'Look only at the printed value "{value}" in this image. Is it CROSSED OUT (a pen '
+                                     "line drawn through it)? A check mark, a note or a value written next to it is NOT "
+                                     "crossing out."},
+        ]}],
+        "temperature": 0.0, "max_tokens": 20,
+        "response_format": {"type": "json_schema", "json_schema": {"name": "crossed_out", "schema": _CROSSED_SCHEMA}},
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    async with _llm_lock:
+        started = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=settings.llm_timeout_s) as client:
+                r = await client.post(f"{settings.llm_base_url}/v1/chat/completions", json=payload)
+        except httpx.HTTPError as exc:
+            raise LlmError(f"llama-server not reachable at {settings.llm_base_url}: {exc!r}") from exc
+        elapsed = time.perf_counter() - started
+    if r.status_code != 200:
+        raise LlmError(f"llama-server returned {r.status_code}: {r.text[:300]}")
+    body = r.json()
+    try:
+        answer = bool(_extract_json(body["choices"][0]["message"].get("content") or "").get("crossed_out"))
+    except (json.JSONDecodeError, AttributeError):
+        answer = False
+    return answer, _call_stats(body, elapsed)
 
 
 def _call_stats(body: dict[str, Any], elapsed: float) -> dict[str, float]:

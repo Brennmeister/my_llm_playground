@@ -30,6 +30,24 @@ class RawParty(BaseModel):
     phone: Optional[str] = None
 
 
+ROW_FIELDS = ("article_number", "description", "quantity", "unit", "unit_price", "discount", "line_total", "delivery_date")
+HEADER_FIELDS = ("order_number", "order_date", "requested_delivery_date", "customer_number", "payment_terms",
+                 "incoterms", "net_total", "gross_total")
+
+
+class RawRowHandwriting(BaseModel):
+    """A printed value of the position that was changed by hand (crossed out / overwritten / added)."""
+    field: Literal[ROW_FIELDS]  # type: ignore[valid-type]
+    printed: Optional[str] = None
+    handwritten: Optional[str] = None
+
+
+class RawHeaderHandwriting(BaseModel):
+    field: Literal[HEADER_FIELDS]  # type: ignore[valid-type]
+    printed: Optional[str] = None
+    handwritten: Optional[str] = None
+
+
 class RawLineItem(BaseModel):
     # Source lines first: the model decides WHERE the position is before copying its values,
     # which keeps all values of one position together (rows can span several lines).
@@ -45,6 +63,8 @@ class RawLineItem(BaseModel):
     discount: Optional[str] = None
     line_total: Optional[str] = None
     delivery_date: Optional[str] = None
+    # only filled from the page image: values changed by hand
+    handwritten: list[RawRowHandwriting] = Field(default_factory=list)
 
 
 class RawHeader(BaseModel):
@@ -64,6 +84,7 @@ class RawHeader(BaseModel):
     tax_rate: Optional[str] = None
     tax_amount: Optional[str] = None
     gross_total: Optional[str] = None
+    handwritten: list[RawHeaderHandwriting] = Field(default_factory=list)
 
 
 class RawItems(BaseModel):
@@ -108,6 +129,10 @@ def _inline_and_require_all(schema: dict[str, Any]) -> dict[str, Any]:
 def llm_json_schema(task: Literal["header", "items", "row"]) -> dict[str, Any]:
     model = {"header": RawHeader, "items": RawItems, "row": RawLineItem}[task]
     schema = _inline_and_require_all(model.model_json_schema())
+    for node in (schema["properties"], *(p["items"]["properties"] for p in schema["properties"].values()
+                                          if p.get("type") == "array" and "properties" in p.get("items", {}))):
+        if "handwritten" in node and node["handwritten"].get("type") == "array":
+            node["handwritten"]["maxItems"] = 4  # bounded: a small model must not loop here
     if task == "items":
         # Hard cap on items keeps generation time bounded on a notebook
         schema["properties"]["line_items"]["maxItems"] = 60
@@ -200,6 +225,14 @@ class Meta(BaseModel):
     item_source: Optional[str] = None              # "llm" (default) or "table_rows" (fallback parser)
     item_lines: list[Optional[list[int]]] = Field(default_factory=list)  # [first, last] source line per item
     items_reread: int = 0                          # positions re-read by a focused second LLM call
+    images_sent: int = 0                           # page / row images the model looked at
+    handwritten: list["HandwrittenChange"] = Field(default_factory=list)  # hand-written values that won
+
+
+class HandwrittenChange(BaseModel):
+    path: str                                      # e.g. "line_items.0.unit_price"
+    printed: Optional[str] = None
+    handwritten: str
 
 
 class ErpOrder(BaseModel):

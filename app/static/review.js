@@ -16,13 +16,14 @@ const LABELS = {
   unit_price: "Unit price", line_total: "Total", discount_percent: "Discount %", net_amount: "Net",
   tax_rate_percent: "Tax %", tax_amount: "Tax", gross_amount: "Gross", line_items_sum: "Sum of lines",
 };
-const ISSUE_STATES = ["missing", "unmatched", "approx"];
+const ISSUE_STATES = ["missing", "unmatched", "approx", "handwritten"];
 const STATE_TEXT = {
   matched: "Found in the PDF", unmatched: "Not found in the PDF – please verify", missing: "Required – missing",
   empty: "Not detected", edited: "Changed – save to re-check against the PDF",
   derived: "Normalized value (code, unit or sum) – not printed literally in the PDF",
   approx: "Similar text found in the PDF – check it and press Enter to confirm",
   confirmed: "Confirmed by reviewer",
+  handwritten: "Handwritten in the PDF – replaces the printed value; check it and press Enter to confirm",
 };
 
 let reviewId;
@@ -75,6 +76,7 @@ function fieldState(path) {
   if (confirmed.has(path)) return "confirmed";
   if (value == null || value === "") return isRequired(path) ? "missing" : "empty";
   const source = review.sources[path];
+  if (source?.handwritten) return "handwritten";
   if (source?.locations?.length) return source.approximate ? "approx" : "matched";
   return source?.derived ? "derived" : "unmatched";
 }
@@ -397,6 +399,13 @@ async function selectField(path, { scroll = true } = {}) {
   const state = fieldState(path);
   const source = review.sources[path];
   if (state === "edited") { setHint("Changed value — save to locate it in the PDF"); return; }
+  if (source?.handwritten) {
+    const { printed, handwritten } = source.handwritten;
+    setHint(`✍ Handwritten: ${handwritten}${printed ? ` (printed: ${printed})` : ""} — press Enter to confirm`);
+    const where = source.locations?.length ? source.locations : source.row_locations;
+    if (where?.length) await highlightPath(path, where[0].page - 1, true);
+    return;
+  }
   if (!source?.locations?.length && source?.row_locations?.length) {
     const note = rowContext(path)?.note;
     const [first, last] = source.lines ?? [];
@@ -653,6 +662,8 @@ function renderRunInfo() {
     ["Generated", `${number(meta.completion_tokens)} tokens` + (meta.completion_tokens_per_s ? ` · ${meta.completion_tokens_per_s} tok/s` : "")],
     ["Line items from", meta.item_source === "table_rows" ? "table row parser (model found no positions)"
       : `LLM, one call per position${meta.items_reread ? ` · ${meta.items_reread} re-read` : ""}`],
+    ["Images", meta.images_sent ? `${meta.images_sent} image(s) sent to the model (pages + position strips)` : "text only"],
+    ["Handwriting", meta.handwritten?.length ? `${meta.handwritten.length} handwritten value(s) replace printed ones` : null],
     ["Text size", `${number(meta.text_chars)} characters`],
   ];
   const list = $("#run-details");

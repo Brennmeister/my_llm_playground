@@ -222,7 +222,8 @@ def reconcile_with_net_total(rows: list[TableRow], net_total: Optional[float]) -
     """
     if net_total is None or len(rows) < 2 or any(row.line_total is None for row in rows):
         return
-    suspects = [row for row in rows if not _consistent(row)][:8]
+    # rows with another reading of the total ("240 105,00": 240.105,00 or 105,00) are suspects too
+    suspects = [row for row in rows if not _consistent(row) or row.total_alternatives][:8]
     if suspects and not _close(sum(row.line_total for row in rows), net_total):
         fixed_sum = sum(row.line_total for row in rows if row not in suspects)
         options = []

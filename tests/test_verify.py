@@ -36,7 +36,7 @@ def test_failed_position_is_reread_from_its_lines():
     ]
     calls = []
 
-    async def fake_extract(text, task, info="", instruction=""):
+    async def fake_extract(text, task, info="", instruction="", images=None):
         calls.append((task, text, instruction))
         return {"first_line": 3, "last_line": 4, "position": "00010", "article_number": "2145723",
                 "description": "HALTEWINKEL 1 M.SCHWEISSMUTTER", "quantity": "150", "unit": "Stück",
@@ -127,3 +127,99 @@ def test_row_without_position_and_article_column():
     harmonize_with_line(item, segments[0][3], [lines[19], lines[20]], "de", warnings)
     assert item.position is None and item.customer_article_number is None and item.delivery_date == "2026-10-27"
 
+
+
+def test_handwritten_price_wins_over_print_and_total_is_recalculated():
+    from app.extractor import _apply_item_handwriting
+    from app.schemas import RawRowHandwriting
+    from app.table_rows import _parse_anchor
+    from app.verify import harmonize_with_line, screen_handwriting
+
+    segment = ["i Grundchassis B77   27.10.2026   50,00 Stk.   2806   1.435,00", "Artikelnr.: 117747300"]
+    row = _parse_anchor(segment[0], "de")
+    item = RawLineItem(first_line=19, last_line=20, article_number="117747300", description="Grundchassis B77",
+                       quantity="50,00", unit="Stk.", unit_price="58,50", line_total="1.435,00",
+                       handwritten=[RawRowHandwriting(field="unit_price", printed="28,70", handwritten="58,50")])
+    screen_handwriting(item, row, "\n".join(segment), True, "de")
+    assert item.unit_price == "28,70" and len(item.handwritten) == 1  # the print is verified first
+    warnings = []
+    harmonize_with_line(item, row, segment, "de", warnings)
+    line_item = LineItem(position=1, quantity=50, unit_price=28.7, line_total=1435.0)
+    changes = _apply_item_handwriting([line_item], [item.handwritten], "de", warnings)
+    assert line_item.unit_price == 58.5 and line_item.line_total == 2925.0
+    assert [c.path for c in changes] == ["line_items.0.unit_price", "line_items.0.line_total"]
+    assert any("handwritten unit_price '58,50'" in w for w in warnings)
+
+    # no image content on the page (digital PDF): claimed handwriting is ignored
+    digital = item.model_copy(update={"handwritten": [RawRowHandwriting(field="quantity", printed="50", handwritten="60")]})
+    screen_handwriting(digital, row, "\n".join(segment), False, "de")
+    assert digital.handwritten == []
+
+
+def test_page_and_row_images_for_multi_page_documents():
+    import pymupdf
+
+    from app.images import PageImages, image_tokens
+    from app.pdf_extract import extract_text
+
+    doc = pymupdf.open()
+    for page_number in (1, 2):
+        page = doc.new_page()
+        page.insert_text((50, 80), f"Seite {page_number}")
+        page.insert_text((50, 120), f"{page_number}0 4711-{page_number} Schraube   10 Stk   1,00   10,00")
+        page.insert_text((50, 135), "Zusatztext")
+    pdf_bytes = doc.tobytes()
+    pdf = extract_text(pdf_bytes, "never")
+    images = PageImages(pdf_bytes, pdf)
+    pages = images.pages([1, 2], token_budget=1500)
+    assert len(pages) == 2 and all(png.startswith(b"\x89PNG") for png in pages)
+    assert 900 < image_tokens(595, 842, 100) < 1000  # A4 at 100 dpi
+    second = [w.line for w in pdf.page_words[1] if w.text == "Schraube"][0]
+    strips = images.rows(second, second + 1)
+    assert len(strips) == 1 and images.sent == 3
+    assert images.visual_pages == set()  # text only: handwriting is not possible
+
+
+def test_printed_position_and_article_column_win():
+    from app.table_rows import _parse_anchor
+    from app.verify import fix_position_number, harmonize_with_line
+
+    segment = ["110   1121111 / Halterung Probe Blech   20 Stk   7,55   151,00", "CAP_HGGS_Rack_Halterung-Probe-Blech_1.00"]
+    row = _parse_anchor(segment[0], "de")
+    item = RawLineItem(first_line=68, last_line=69, position="1121111", article_number="CAP_HGGS_Rack_Halterung-Probe-Blech_1.00",
+                       description="Halterung Probe Blech", quantity="20", unit="Stk", unit_price="7,55", line_total="151,00")
+    fix_position_number(item, "110", segment[0])
+    warnings = []
+    harmonize_with_line(item, row, segment, "de", warnings)
+    assert item.position == "110" and item.article_number == "1121111"
+    assert "CAP_HGGS_Rack_Halterung-Probe-Blech_1.00" in item.description
+
+
+def test_handwriting_needs_a_crossed_out_printed_value():
+    from app.schemas import RawRowHandwriting
+    from app.verify import anchor_segments, confirm_handwriting
+
+    lines = {1: "Pos. Artikel-Nr. Bezeichnung   Menge ME Preis Gesamt",
+             2: "40 3300-07 Winkel 90 Grad   50 Stk 2,10 105,00", 3: "verzinkt   2,40",
+             4: "90 1128921   50 Stk   15,15   757,50", 5: "1LZ", 6: "Summe netto 862,50"}
+    segments = anchor_segments(lines, "de")
+    items = [RawLineItem(first_line=2, last_line=2, position="40", quantity="50", unit_price="2,10", line_total="105,00"),
+             RawLineItem(first_line=4, last_line=4, position="90", quantity="50", unit_price="1,15", line_total="757,50",
+                         handwritten=[RawRowHandwriting(field="unit_price", printed="15,15", handwritten="1,15")])]
+    asked = []
+
+    async def fake_crossed_out(image, value):
+        asked.append(value)
+        return value == "2,10", {"seconds": 0.5}
+
+    class Strips:
+        def rows(self, first, last, stop_before=None):
+            return [b"png"]
+
+    stats = {}
+    with mock.patch.object(llm, "crossed_out", fake_crossed_out):
+        asyncio.run(confirm_handwriting(items, segments, lines, "de", stats, Strips(), frozenset({2, 3, 4, 5})))
+    # the number under position 40 is a candidate; 2,10 is struck through -> kept
+    assert [(h.field, h.printed, h.handwritten) for h in items[0].handwritten] == [("unit_price", "2,10", "2,40")]
+    # the model's "correction" of position 90 is a note next to an intact price -> dropped
+    assert items[1].handwritten == [] and asked == ["2,10", "15,15"] and stats["calls"] == 2

@@ -129,6 +129,8 @@ body.reviewing{height:100vh;height:100dvh;overflow:hidden}
 .field[data-state=matched] .dot{background:#2f9a6d}
 .field[data-state=unmatched] .dot{background:#e0a020}
 .field[data-state=missing] .dot{background:#d0473b}
+.field[data-state=handwritten] .dot{background:#7a4fd0}
+.field[data-state=handwritten] input{background:#f7f3ff;border-color:#d6c8f3;font-style:italic}
 .field[data-state=edited] .dot{background:#3e78c8}
 .field[data-state=derived] .dot{background:#9fb3c8}
 .field[data-state=approx] .dot{background:linear-gradient(90deg,#2f9a6d 50%,#e0a020 50%)}

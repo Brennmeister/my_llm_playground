@@ -22,19 +22,23 @@ from .normalize import (
     split_postal_city,
     valid_email,
 )
+from .images import PageImages
 from .pdf_extract import OcrMode, PdfText, chunk_pages, extract_text
 from .table_rows import TableRow, parse_rows, reconcile_with_net_total, rows_look_reliable
 from .table_rows import _repair_amounts as _repair_row_amounts
 from .verify import _numbers as numbers_in_text
-from .verify import anchor_segments, arithmetic_ok, extract_positions, fix_position_number, harmonize_with_line, reconcile_items_with_net_total, reread_failed_items
+from .verify import (anchor_segments, arithmetic_ok, confirm_handwriting, extract_positions, fix_position_number,
+                     harmonize_with_line, reconcile_items_with_net_total, reread_failed_items, screen_handwriting)
 from .schemas import (
     Contact,
     DocumentHeader,
+    HandwrittenChange,
     ErpOrder,
     LineItem,
     Meta,
     Party,
     RawHeader,
+    RawHeaderHandwriting,
     RawItems,
     RawLineItem,
     RawOrder,
@@ -87,6 +91,8 @@ def merge_raw(results: list[RawOrder]) -> RawOrder:
         for f in _TOTAL_FIELDS:
             if clean_str(getattr(r, f)):
                 setattr(merged, f, getattr(r, f))
+    for r in results:
+        merged.handwritten += [h for h in r.handwritten if not any(h.field == k.field for k in merged.handwritten)]
     seen: set[tuple] = set()
     for r in results:
         for it in r.line_items:
@@ -304,9 +310,10 @@ def _grounded_text(text: str, g: Grounder) -> bool:
 
 
 def _items_from_llm(raw: RawOrder, lang: Optional[str], header: DocumentHeader, grounder: Optional[Grounder],
-                    warnings: list[str]) -> tuple[list[LineItem], list[Optional[list[int]]]]:
+                    warnings: list[str]) -> tuple[list[LineItem], list[Optional[list[int]]], list[list]]:
     items: list[LineItem] = []
     spans: list[Optional[list[int]]] = []
+    handwriting: list[list] = []
     for idx, ri in enumerate(raw.line_items, start=1):
         if _is_summary_row(ri):
             warnings.append(f"Ignored a summary row returned as line item: '{clean_str(ri.description)}'.")
@@ -352,8 +359,9 @@ def _items_from_llm(raw: RawOrder, lang: Optional[str], header: DocumentHeader, 
         items.append(item)
         spans.append([ri.first_line, ri.last_line if ri.last_line is not None else ri.first_line]
                      if ri.first_line is not None else None)
+        handwriting.append(list(ri.handwritten))
 
-    return items, spans
+    return items, spans, handwriting
 
 
 def _items_from_rows(rows: list[TableRow], raw: RawOrder, header: DocumentHeader, grounder: Optional[Grounder],
@@ -414,6 +422,7 @@ def normalize_order(raw: RawOrder, lang: Optional[str], full_text: str) -> ErpOr
     raw = sanitize(raw, full_text, warnings) if full_text else raw
     if full_text:
         raw = apply_label_fallbacks(raw, full_text, lang, warnings)
+    changes = _apply_header_handwriting(raw, lang, warnings)
     grounder = Grounder(full_text) if full_text else None
 
     buyer, supplier = _party(raw.buyer), _party(raw.supplier)
@@ -444,10 +453,12 @@ def normalize_order(raw: RawOrder, lang: Optional[str], full_text: str) -> ErpOr
     rows = parse_rows([full_text], lang) if full_text and not raw.line_items else []
     if raw.line_items or not rows_look_reliable(rows, net_total):
         # Main path: the LLM's positions (any layout), checked arithmetically
-        items, item_lines = _items_from_llm(raw, lang, header, grounder, warnings)
+        items, item_lines, item_handwriting = _items_from_llm(raw, lang, header, grounder, warnings)
         item_source = "llm"
         reconcile_items_with_net_total(items, net_total, warnings)
         _drop_stale_mismatch_warnings(items, warnings)
+        # handwriting wins over print - applied after the printed values were verified
+        changes += _apply_item_handwriting(items, item_handwriting, lang, warnings)
     else:
         # Fallback only when the model returned no positions at all: row-wise table parser
         reconcile_with_net_total(rows, net_total)
@@ -496,8 +507,73 @@ def normalize_order(raw: RawOrder, lang: Optional[str], full_text: str) -> ErpOr
         line_items=items,
         totals=totals,
         validation=Validation(is_complete=not missing, missing_required_fields=missing, warnings=warnings),
-        meta=Meta(item_source=item_source, item_lines=item_lines),
+        meta=Meta(item_source=item_source, item_lines=item_lines, handwritten=changes),
     )
+
+
+_HEADER_PATHS = {"order_number": "document.order_number", "order_date": "document.order_date",
+                 "requested_delivery_date": "document.requested_delivery_date",
+                 "customer_number": "document.customer_number", "payment_terms": "document.payment_terms",
+                 "incoterms": "document.incoterms", "net_total": "totals.net_amount", "gross_total": "totals.gross_amount"}
+
+
+def _apply_header_handwriting(raw: RawOrder, lang: Optional[str], warnings: list[str]) -> list[HandwrittenChange]:
+    """Handwritten header values (screened per page in extract_order) replace the printed ones."""
+    changes = []
+    for change in raw.handwritten:
+        written = clean_str(change.handwritten)
+        if not written:
+            continue
+        if change.field in ("order_date", "requested_delivery_date") and not parse_date(written, lang):
+            continue
+        if change.field in ("net_total", "gross_total") and parse_number(written, lang) is None:
+            continue
+        printed = clean_str(change.printed) or clean_str(getattr(raw, change.field))
+        setattr(raw, change.field, written)
+        warnings.append(f"Handwritten {change.field} '{written}' replaces the printed value"
+                        f"{f' {printed!r}' if printed else ''} - please verify.")
+        changes.append(HandwrittenChange(path=_HEADER_PATHS[change.field], printed=printed, handwritten=written))
+    return changes
+
+
+def _apply_item_handwriting(items: list[LineItem], handwriting: list[list], lang: Optional[str],
+                            warnings: list[str]) -> list[HandwrittenChange]:
+    changes = []
+    for index, (item, entries) in enumerate(zip(items, handwriting)):
+        touched = set()
+        for change in entries:
+            written = clean_str(change.handwritten)
+            if change.field in ("quantity", "unit_price", "line_total", "discount"):
+                value = parse_number(written, lang)
+            elif change.field == "delivery_date":
+                value = parse_date(written, lang)
+            else:
+                value = written
+            if value is None:
+                continue
+            attr = {"article_number": "supplier_article_number", "unit": "unit_raw", "discount": "discount_percent",
+                    "delivery_date": "requested_delivery_date"}.get(change.field, change.field)
+            before = getattr(item, attr)
+            printed = clean_str(change.printed) or (None if before is None else f"{before:g}" if isinstance(before, float) else str(before))
+            setattr(item, attr, value)
+            if attr == "unit_raw":
+                item.unit_code = normalize_unit(value) or item.unit_code
+            touched.add(change.field)
+            warnings.append(f"Position {item.position}: handwritten {change.field} '{written}' replaces the printed "
+                            f"value{f' {printed!r}' if printed else ''} - please verify.")
+            changes.append(HandwrittenChange(path=f"line_items.{index}.{attr}", printed=printed, handwritten=written))
+        # the printed total belongs to the printed price/quantity: recalculate it from the handwritten ones
+        if touched & {"quantity", "unit_price", "discount"} and "line_total" not in touched \
+                and item.quantity is not None and item.unit_price is not None:
+            total = round(item.quantity * item.unit_price * (1 - (item.discount_percent or 0) / 100), 2)
+            if item.line_total is None or abs(total - item.line_total) > 0.005:
+                printed = None if item.line_total is None else f"{item.line_total:.2f}"
+                warnings.append(f"Position {item.position}: line total recalculated from the handwritten values: "
+                                f"{total:.2f} (printed {printed or '-'}).")
+                changes.append(HandwrittenChange(path=f"line_items.{index}.line_total", printed=printed,
+                                                 handwritten=f"{total:.2f} (calculated)"))
+                item.line_total = total
+    return changes
 
 
 # ---------------------------------------------------------------------------
@@ -505,8 +581,9 @@ def normalize_order(raw: RawOrder, lang: Optional[str], full_text: str) -> ErpOr
 # ---------------------------------------------------------------------------
 
 
-async def _llm_pass(chunk: str, task: str, info: str, warnings: list[str], stats: dict[str, float]) -> dict:
-    data = await llm.extract(chunk, task, info)
+async def _llm_pass(chunk: str, task: str, info: str, warnings: list[str], stats: dict[str, float],
+                    images: Optional[list[bytes]] = None) -> dict:
+    data = await llm.extract(chunk, task, info, images=images)
     for key, value in data.pop("_stats", {}).items():
         stats[key] = stats.get(key, 0) + value
     stats["calls"] = stats.get("calls", 0) + 1
@@ -516,28 +593,71 @@ async def _llm_pass(chunk: str, task: str, info: str, warnings: list[str], stats
     return data
 
 
-async def _extract_header(chunk: str, info: str, warnings: list[str], stats: dict[str, float]) -> RawOrder:
+def _screen_header_handwriting(raw: RawOrder, chunk: str) -> list[RawHeaderHandwriting]:
+    """A small model also lists printed values as 'handwritten': keep only values that differ from the
+    print and are not in the printed text."""
+    lang = detect_language(chunk)
+    squashed = re.sub(r"[\W_]+", "", chunk.lower())
+    printed_dates, printed_numbers = labels.dates_in_text(chunk, lang), numbers_in_text(chunk, lang)
+    kept = []
+    for change in raw.handwritten:
+        written = clean_str(change.handwritten)
+        if not written or any(k.field == change.field for k in kept):
+            continue
+        key = re.sub(r"[\W_]+", "", written.lower())
+        if key == re.sub(r"[\W_]+", "", (clean_str(change.printed) or "").lower()) or (len(key) >= 3 and key in squashed):
+            continue
+        if change.field.endswith("date") and parse_date(written, lang) in printed_dates:
+            continue
+        if change.field.endswith("total") and any(abs((parse_number(written, lang) or -1e9) - n) < 0.005 for n in printed_numbers):
+            continue
+        kept.append(change)
+    return kept
+
+
+def _chunk_pages(chunk: str) -> list[int]:
+    return [int(n) for n in re.findall(r"^--- Page (\d+) ---$", chunk, flags=re.M)]
+
+
+async def _extract_header(chunk: str, info: str, warnings: list[str], stats: dict[str, float],
+                          images: Optional[PageImages] = None) -> RawOrder:
+    pages = _chunk_pages(chunk)
+    pictures = images.pages(pages) if images is not None else None
     try:
-        return RawOrder.model_validate(RawHeader.model_validate(await _llm_pass(chunk, "header", info, warnings, stats)).model_dump())
+        raw = RawOrder.model_validate(RawHeader.model_validate(
+            await _llm_pass(chunk, "header", info, warnings, stats, pictures)).model_dump())
+        if not pictures or images is None or not images.visual_pages & set(pages):
+            raw.handwritten = []  # no image content: no handwriting
+        raw.handwritten = _screen_header_handwriting(raw, chunk)
+        return raw
     except ValidationError as exc:
         warnings.append(f"{info or 'document'} / header: LLM output did not match schema ({exc.error_count()} errors).")
         return RawOrder()
 
 
+def _line_pages(pdf: PdfText) -> dict[int, int]:
+    return {word.line: word.page for page in pdf.page_words for word in page}
+
+
 def _check_against_lines(items: list[RawLineItem], segments, lines: dict[int, str], lang: Optional[str],
-                         warnings: list[str]) -> None:
+                         warnings: list[str], visual_lines: set[int] = frozenset()) -> None:
     for item, (first, last, printed, row) in zip(items, segments):
         fix_position_number(item, printed, lines.get(first, ""))
-        harmonize_with_line(item, row, [lines[n] for n in range(first, last + 1) if n in lines], lang, warnings)
+        segment = [lines[n] for n in range(first, last + 1) if n in lines]
+        seen = bool(visual_lines & set(range(first, last + 1)))
+        screen_handwriting(item, row, "\n".join(segment), seen, lang)
+        harmonize_with_line(item, row, segment, lang, warnings, seen)
 
 
-async def _extract_items_whole(chunks: list[str], warnings: list[str], stats: dict[str, float]) -> list[RawLineItem]:
+async def _extract_items_whole(chunks: list[str], warnings: list[str], stats: dict[str, float],
+                               images: Optional[PageImages] = None) -> list[RawLineItem]:
     """All positions in one LLM call per chunk - for tables without recognizable position lines."""
     items: list[RawLineItem] = []
     for i, chunk in enumerate(chunks, start=1):
         info = f"part {i} of {len(chunks)}" if len(chunks) > 1 else ""
+        pictures = images.pages(_chunk_pages(chunk)) if images is not None else None
         try:
-            items += RawItems.model_validate(await _llm_pass(chunk, "items", info, warnings, stats)).line_items
+            items += RawItems.model_validate(await _llm_pass(chunk, "items", info, warnings, stats, pictures)).line_items
         except ValidationError as exc:
             warnings.append(f"{info or 'document'} / items: LLM output did not match schema ({exc.error_count()} errors).")
     return items
@@ -559,9 +679,12 @@ async def extract_order(
     warnings = list(pdf.warnings)
     stats: dict[str, float] = {}
     raw_results = []
+    images = PageImages(pdf_bytes, pdf)
+    line_pages = _line_pages(pdf)
+    visual_lines = {line for line, page in line_pages.items() if page in images.visual_pages}
     for i, chunk in enumerate(chunks, start=1):
         info = f"part {i} of {len(chunks)}" if len(chunks) > 1 else ""
-        raw_results.append(await _extract_header(chunk, info, warnings, stats))
+        raw_results.append(await _extract_header(chunk, info, warnings, stats, images))
 
     rereads = 0
     if raw_results:
@@ -576,16 +699,19 @@ async def extract_order(
                 _repair_row_amounts(row)
             reconcile_with_net_total(rows, net)
             # one focused LLM call per position: values cannot slip into a neighbouring position
-            merged.line_items = await extract_positions(segments, lines, stats)
-            rereads = await reread_failed_items(merged.line_items, lines, lang, warnings, stats)
-            _check_against_lines(merged.line_items, segments, lines, lang, warnings)
+            merged.line_items = await extract_positions(segments, lines, stats, images)
+            rereads = await reread_failed_items(merged.line_items, lines, lang, warnings, stats, images)
+            await confirm_handwriting(merged.line_items, segments, lines, lang, stats, images, visual_lines)
+            _check_against_lines(merged.line_items, segments, lines, lang, warnings, visual_lines)
         else:
-            merged.line_items = await _extract_items_whole(chunks, warnings, stats)
+            merged.line_items = await _extract_items_whole(chunks, warnings, stats, images)
             if merged.line_items:
-                rereads = await reread_failed_items(merged.line_items, lines, lang, warnings, stats)
+                rereads = await reread_failed_items(merged.line_items, lines, lang, warnings, stats, images)
                 for item in merged.line_items:  # a cited line number is not a position number
                     if item.first_line:
                         fix_position_number(item, None, lines.get(item.first_line, ""))
+                    cited = set(range(item.first_line or 0, (item.last_line or item.first_line or 0) + 1))
+                    screen_handwriting(item, None, "\n".join(lines.get(n, "") for n in cited), bool(visual_lines & cited), lang)
         order = normalize_order(merged, lang, full_text)
     else:
         order = ErpOrder()
@@ -613,5 +739,8 @@ async def extract_order(
         item_source=order.meta.item_source,
         item_lines=order.meta.item_lines,
         items_reread=rereads,
+        images_sent=images.sent,
+        handwritten=order.meta.handwritten,
     )
+    images.close()
     return order

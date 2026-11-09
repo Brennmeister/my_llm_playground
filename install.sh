@@ -37,6 +37,8 @@ load_env() {
 load_env
 MODEL_REPO="${MODEL_REPO:-unsloth/Qwen3.5-0.8B-GGUF}"
 MODEL_FILE="${MODEL_FILE:-Qwen3.5-0.8B-Q8_0.gguf}"
+# vision part of the model (the LLM also sees the page images); empty = text only
+MMPROJ_FILE="${MMPROJ_FILE-mmproj-BF16.gguf}"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 OS="$(uname -s)"
@@ -198,6 +200,16 @@ from huggingface_hub import hf_hub_download
 path = hf_hub_download(repo_id=sys.argv[1], filename=sys.argv[2], local_dir="models")
 print("Model:", path)
 PY
+if [ -n "$MMPROJ_FILE" ]; then
+  log "Downloading vision projector $MODEL_REPO / $MMPROJ_FILE"
+  # every repo names it the same - keep one per repo
+  .venv/bin/python - "$MODEL_REPO" "$MMPROJ_FILE" <<'PY'
+import sys
+from huggingface_hub import hf_hub_download
+path = hf_hub_download(repo_id=sys.argv[1], filename=sys.argv[2], local_dir=f"models/mmproj/{sys.argv[1].split('/')[-1]}")
+print("Vision projector:", path)
+PY
+fi
 
 # ---------------------------------------------------------------------------
 # 5. Checks

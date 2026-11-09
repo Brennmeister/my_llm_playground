@@ -16,6 +16,12 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.0
     # Context window the server is started with (keep in sync with LLM_CTX in start.sh)
     llm_ctx: int = 8192
+    # The model also SEES the document (Qwen3.5 is a vision-language model; llama-server loads the
+    # mmproj file with the model): all = every page, scans = OCR'd pages only, off = text only
+    llm_images: str = "all"
+    llm_page_image_tokens: int = 1500   # image budget of a header call (all pages of the chunk)
+    llm_page_image_dpi: int = 110       # upper limit for page images
+    llm_row_image_dpi: int = 150        # strip of one position (small, sharp: handwriting, faint digits)
 
     # --- Document handling -------------------------------------------------------
     # Max characters of PDF text sent to the LLM per call. 0.8B models degrade on long

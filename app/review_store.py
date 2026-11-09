@@ -304,9 +304,18 @@ def match_sources(order: ErpOrder, pdf: PdfText) -> dict[str, dict[str, Any]]:
             chosen[path] = first._replace(confidence=round(first.confidence * 0.9, 2))
             ambiguous.add(path)
 
+    # a position without its own delivery date inherits the header's: point to that one
+    values = dict(leaves)
+    header_date = chosen.get("document.requested_delivery_date")
+    for path, value in leaves:
+        if path.endswith(".requested_delivery_date") and path.startswith("line_items.") and path not in chosen \
+                and header_date and value == values.get("document.requested_delivery_date"):
+            chosen[path] = header_date._replace(confidence=round(header_date.confidence * 0.9, 2))
+    handwritten = {change.path: change for change in order.meta.handwritten}
     sources: dict[str, dict[str, Any]] = {}
     for path, value in leaves:
-        match = chosen.get(path)
+        # a handwritten value is not in the printed text: any text match is a coincidence
+        match = None if path in handwritten else chosen.get(path)
         sources[path] = {
             "extracted_value": value,
             "confidence": match.confidence if match else 0.0,
@@ -315,6 +324,9 @@ def match_sources(order: ErpOrder, pdf: PdfText) -> dict[str, dict[str, Any]]:
             "ambiguous": path in ambiguous,
             "occurrences": len(options[path]),
             "derived": bool(_DERIVED.match(path)),
+            # written by hand: the printed text shows another value, a reviewer must look at it
+            "handwritten": ({"printed": handwritten[path].printed, "handwritten": handwritten[path].handwritten}
+                            if path in handwritten else None),
             "lines": spans.get(_group(path)),
             "row_locations": _row_boxes(pdf, spans.get(_group(path))) if not match else [],
             "locations": [
@@ -353,7 +365,7 @@ def unmatched_paths(sources: dict[str, dict[str, Any]]) -> list[str]:
     return [
         path for path, source in sources.items()
         if not source.get("confirmed") and not source.get("derived")
-        and (not source["locations"] or source.get("approximate"))
+        and (not source["locations"] or source.get("approximate") or source.get("handwritten"))
     ]
 
 

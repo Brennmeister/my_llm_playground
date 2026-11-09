@@ -21,6 +21,15 @@ load_env
 
 MODEL_FILE="${MODEL_FILE:-Qwen3.5-0.8B-Q8_0.gguf}"
 MODEL_PATH="$ROOT/models/$MODEL_FILE"
+MODEL_REPO="${MODEL_REPO:-unsloth/Qwen3.5-0.8B-GGUF}"
+MMPROJ_FILE="${MMPROJ_FILE-mmproj-BF16.gguf}"
+MMPROJ_PATH="$ROOT/models/mmproj/${MODEL_REPO##*/}/$MMPROJ_FILE"
+VISION_ARGS=()
+if [ -n "$MMPROJ_FILE" ] && [ -f "$MMPROJ_PATH" ]; then
+  VISION_ARGS=(--mmproj "$MMPROJ_PATH")   # the model also sees the page images
+elif [ -n "$MMPROJ_FILE" ]; then
+  echo "Vision projector $MMPROJ_PATH missing - run ./install.sh (text only until then)"
+fi
 LLM_PORT="${LLM_PORT:-8081}"
 LLM_CTX="${LLM_CTX:-8192}"
 LLM_NGL="${LLM_NGL:-99}"
@@ -66,6 +75,7 @@ echo "Starting llama-server on port $LLM_PORT (log: logs/llama-server.log)"
   --jinja \
   --no-webui \
   "${THREAD_ARGS[@]}" \
+  "${VISION_ARGS[@]}" \
   > logs/llama-server.log 2>&1 &
 LLAMA_PID=$!
 
