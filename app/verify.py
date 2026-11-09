@@ -15,7 +15,7 @@ from typing import Optional
 from . import llm
 from .normalize import normalize_unit, parse_number
 from .schemas import LineItem, RawLineItem
-from .table_rows import _MONEY, _STOP_LINE, TableRow, _join, _parse_anchor, _second_line_article
+from .table_rows import _DIMENSION, _MONEY, _QTY_UNIT, _STOP_LINE, TableRow, _join, _parse_anchor, _second_line_article
 
 log = logging.getLogger(__name__)
 
@@ -214,6 +214,15 @@ def harmonize_with_line(item: RawLineItem, row: TableRow, segment: list[str], la
             if value is not None and (model[name] is None or abs(model[name] - value) > 0.0001):
                 changed.append(f"{name} {getattr(item, name) or '-'} -> {value:g}")
                 setattr(item, name, f"{value:g}".replace(".", "," if lang in ("de", "pl", "it") else "."))
+    # The quantity is the number printed right before the unit. With zero/missing prices the arithmetic
+    # cannot catch a quantity taken from the position number ("1,0 ... 10 Stk" -> 1).
+    qty = parse_number(item.quantity, lang)
+    if row.quantity and qty is not None and abs(qty - row.quantity) > 0.0001:
+        printed = {parse_number(m.group("qty"), lang) for m in _QTY_UNIT.finditer(text)
+                   if not _DIMENSION.search(text[:m.start()]) and not _DIMENSION.search(text[m.end():])}
+        if not any(p is not None and abs(qty - p) < 0.0001 for p in printed):
+            changed.append(f"quantity {item.quantity} -> {row.quantity:g} (number before the unit)")
+            item.quantity = f"{row.quantity:g}".replace(".", "," if lang in ("de", "pl", "it") else ".")
     # "1545" for 15,45: per-100/1000 price or a lost decimal separator - the ERP needs the per-unit price
     qty, price, total = (parse_number(getattr(item, k), lang) for k in ("quantity", "unit_price", "line_total"))
     if qty and price and total and not _close(qty * price * (1 - (discount or 0) / 100), total):

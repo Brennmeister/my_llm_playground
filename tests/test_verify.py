@@ -86,3 +86,24 @@ def test_model_values_are_kept_when_they_are_in_the_lines_and_add_up():
     harmonize_with_line(bad, row, segment, "de", warnings)
     assert (bad.position, bad.quantity, bad.line_total, bad.article_number) == ("50", "160", "2320", "1128035")
     assert warnings and "quantity 50 -> 160" in warnings[0]
+
+
+def test_decimal_position_numbers_dimensions_and_zero_prices():
+    """Order without prices: "1,0" positions, dimension lines ("60 x 10 x 175mm / 100 Stck.")."""
+    from app.table_rows import _parse_anchor
+    from app.verify import anchor_segments, harmonize_with_line
+
+    lines = {1: "Pos. Artikel / Bezeichnung   Termin   Menge/ME Preis EUR Rabatt Gesamt EUR",
+             2: "1,0 06.1950.010_0   15.11.2026   10 Stk   0,00 0,00%", 3: "Gabel Boden S355", 4: "60 x 10 x 175mm",
+             5: "2,0 06.1951.010_0   15.11.2026   10 Stk   0,00 0,00%", 6: "60 x 10 x 175mm / 100 Stck.",
+             7: "Rechnungen bitte an: invoice@example.com", 8: "Warenwert   0,00 EUR"}
+    segments = anchor_segments(lines, "de")
+    assert [(first, last, position) for first, last, position, _ in segments] == [(2, 4, "1"), (5, 6, "2")]
+    assert segments[0][3].article_number == "06.1950.010_0" and segments[0][3].quantity == 10
+
+    segment = [lines[n] for n in range(2, 5)]
+    item = RawLineItem(first_line=2, last_line=4, position="1", article_number="06.1950.010_0",
+                       description="Gabel Boden S355", quantity="1,0", unit="Stk", unit_price="0,00", line_total="0,00")
+    warnings = []
+    harmonize_with_line(item, _parse_anchor(segment[0], "de"), segment, "de", warnings)
+    assert item.quantity == "10" and "number before the unit" in warnings[0]

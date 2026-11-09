@@ -24,13 +24,16 @@ _AMOUNT = re.compile(r"(?<![\w.,])-?\d{1,3}(?:[.,' ]\d{3})*(?:[,.:;]\d{2})(?![\d
 # A free-standing money amount ("525,00", "5,355.00 EUR") - description lines do not contain those
 _MONEY = re.compile(r"(?:^|\s)\d{1,3}(?:[.,' ]\d{3})*[.,]\d{2}(?=\s|$|€|zł|EUR|PLN)")
 _PERCENT = re.compile(r"(\d+(?:[.,]\d+)?)\s*%")
-_POSITION = re.compile(r"^\d{1,5}$")
+_POSITION = re.compile(r"^\d{1,5}(?:[.,]0{1,2})?$")  # "10", "00010", "1,0" / "2.00"
+# "60 x 10 x 175mm": a dimension, not a quantity
+_DIMENSION = re.compile(r"\d\s*[x×*]\s*$|^\s*[x×*]\s*\d", re.I)
+_DECIMAL_AMOUNT = re.compile(r"\d[,.:;]\d{2}(?!\d)")
 _ARTICLE = re.compile(r"^(?=.*\d)[\w./+-]{3,}$")
 _STOP_LINE = re.compile(
     r"^\s*(referenz|reference|ref\.|ihre\s+ref|total|summe|zwischensumme|gesamt|übertrag|uebertrag|netto|brutto|"
     r"mwst|ust|vat|vorsteuer|endbetrag|razem|suma|totale|imponibile|post-\s+und|bankverbindung|seite|page|strona|pagina|"
     r"net\b|net\s+total|subtotal|amount|tax|wartość|podsumowanie|iva\b|importo|"
-    r"bestellung:|datum:|liefer|zahlungs|payment|mit\s+freundlichen)",
+    r"bestellung:|datum:|liefer|zahlungs|payment|mit\s+freundlichen|rechnung|invoice|warenwert)",
     re.I,
 )
 # OCR debris at the end of a line: "|", "©", "/", stray single letters
@@ -76,14 +79,17 @@ def _parse_anchor(line: str, lang: Optional[str]) -> Optional[TableRow]:
     # the LAST "<number> <unit>" followed by amounts: "Stahlblech 2 mm  12,5 kg  3,40  42,50" -> 12,5 kg
     match = None
     for candidate in _QTY_UNIT.finditer(line):
-        if _AMOUNT.search(line[candidate.end():]):
+        if _DIMENSION.search(line[:candidate.start()]) or _DIMENSION.search(line[candidate.end():]):
+            continue
+        # a price column carries decimals: "10 Stk 0,00", not "175mm / 100 Stck."
+        if _DECIMAL_AMOUNT.search(_PERCENT.sub(" ", line[candidate.end():])):
             match = candidate
     if not match:
         return None
     before = line[:match.start()].split()
     if not before or not any(re.search(r"\d", token) for token in before[:3]):
         return None
-    position = int(before[0]) if _POSITION.match(before[0]) else None
+    position = int(re.split(r"[.,]", before[0])[0]) if _POSITION.match(before[0]) else None
     rest_tokens = before[1:] if position is not None else before
     article = None
     if rest_tokens and _ARTICLE.match(rest_tokens[0].strip("—–-")):
@@ -93,12 +99,12 @@ def _parse_anchor(line: str, lang: Optional[str]) -> Optional[TableRow]:
         return None
     inline = " ".join(rest_tokens).strip(" /|-—")
     after = line[match.end():]
-    tokens = [token for token in _AMOUNT.findall(after) if _amount(token, lang) is not None]
+    discount = _PERCENT.search(after)
+    tokens = [token for token in _AMOUNT.findall(_PERCENT.sub(" ", after)) if _amount(token, lang) is not None]
     amounts = [_amount(token, lang) for token in tokens]
     alternatives = []
     if tokens and re.search(r"\d\s\d", tokens[-1]):  # "7 151,00": stray digit or thousands group?
         alternatives.append(_amount(tokens[-1].split(None, 1)[1], lang))
-    discount = _PERCENT.search(after)
     quantity = parse_number(match.group("qty"), lang)
     if quantity is None or not amounts:
         return None

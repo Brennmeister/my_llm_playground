@@ -112,7 +112,7 @@ class Match(NamedTuple):
     kind: str  # exact | equivalent (same date/number, other format) | approximate (similar text)
 
 
-def _candidates(value: Any, language: str | None, pdf: PdfText) -> list[Match]:
+def _candidates(value: Any, language: str | None, pdf: PdfText, percent: bool = False) -> list[Match]:
     target = _word_tokens(str(value))
     candidates: dict[tuple[str, ...], Match] = {}
     if isinstance(value, str):
@@ -151,6 +151,8 @@ def _candidates(value: Any, language: str | None, pdf: PdfText) -> list[Match]:
                     if expected_date and parse_date(phrase, language) == expected_date:
                         candidates[tuple(word.id for word in words)] = Match(words, 0.85, "equivalent")
                         continue
+                    if not percent and phrase.rstrip().endswith("%"):
+                        continue  # "0,00%" in the discount column is not an amount
                     number = parse_number(phrase, language)
                     if expected_number is not None and number is not None and abs(number - expected_number) < 0.0001:
                         candidates[tuple(word.id for word in words)] = Match(words, 0.85, "equivalent")
@@ -267,7 +269,7 @@ def match_sources(order: ErpOrder, pdf: PdfText) -> dict[str, dict[str, Any]]:
     """
     language = order.document.language
     leaves = list(_field_leaves(order.model_dump(mode="json")))
-    options = {path: _candidates(value, language, pdf) for path, value in leaves}
+    options = {path: _candidates(value, language, pdf, path.endswith("_percent")) for path, value in leaves}
     spans = _item_spans(order)
     for path, found in options.items():
         span = spans.get(_group(path))
