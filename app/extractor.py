@@ -176,7 +176,9 @@ def sanitize(raw: RawOrder, text: str, warnings: list[str]) -> RawOrder:
             if v and not g.has(v):
                 warnings.append(f"Article number '{v}' not found in document - removed.")
                 setattr(it, f, None)
-        if it.delivery_date and clean_str(it.delivery_date) == clean_str(raw.order_date):
+        # the order date copied into the position - unless the date is printed again (in the row)
+        date = clean_str(it.delivery_date)
+        if date and date == clean_str(raw.order_date) and text.count(date) < 2:
             it.delivery_date = None
     return raw
 
@@ -581,6 +583,9 @@ async def extract_order(
             merged.line_items = await _extract_items_whole(chunks, warnings, stats)
             if merged.line_items:
                 rereads = await reread_failed_items(merged.line_items, lines, lang, warnings, stats)
+                for item in merged.line_items:  # a cited line number is not a position number
+                    if item.first_line:
+                        fix_position_number(item, None, lines.get(item.first_line, ""))
         order = normalize_order(merged, lang, full_text)
     else:
         order = ErpOrder()

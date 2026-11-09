@@ -107,3 +107,23 @@ def test_decimal_position_numbers_dimensions_and_zero_prices():
     warnings = []
     harmonize_with_line(item, _parse_anchor(segment[0], "de"), segment, "de", warnings)
     assert item.quantity == "10" and "number before the unit" in warnings[0]
+
+
+def test_row_without_position_and_article_column():
+    """Scan where the light-gray position "1" is OCR'd as "i": the row is still found, the line
+    number is not taken as position, header values do not leak in, the row's date is kept."""
+    from app.verify import anchor_segments, fix_position_number, harmonize_with_line
+
+    lines = {17: "10024224   Li WE TE", 18: "Beschreibung   Liefertermin Menge ME Preis Gesamtbetrag",
+             19: "i Grundchassis B77 V1.1 schwarz pulverbeschichtet   27.10.2026   50,00 Stk.   28,70   1.435,00",
+             20: "Artikelnr.: 117747300", 21: "Nettobetrag   1.435,00"}
+    segments = anchor_segments(lines, "de")
+    assert [(first, last, position) for first, last, position, _ in segments] == [(19, 20, None)]
+    item = RawLineItem(first_line=19, last_line=20, position="19", article_number="117747300",
+                       customer_article_number="10024224", description="Grundchassis B77 V1.1 schwarz pulverbeschichtet",
+                       quantity="50,00", unit="Stk.", unit_price="28,70", line_total="1.435,00")
+    fix_position_number(item, None, lines[19])
+    warnings = []
+    harmonize_with_line(item, segments[0][3], [lines[19], lines[20]], "de", warnings)
+    assert item.position is None and item.customer_article_number is None and item.delivery_date == "2026-10-27"
+

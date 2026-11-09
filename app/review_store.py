@@ -274,8 +274,9 @@ def match_sources(order: ErpOrder, pdf: PdfText) -> dict[str, dict[str, Any]]:
     for path, found in options.items():
         span = spans.get(_group(path))
         if span and found:  # the model cited the lines of this position: prefer matches inside them
-            inside = [m for m in found if all(span[0] <= word.line <= span[1] for word in m.words)]
-            options[path] = inside or found
+            # a position's values sit on its own lines - a match elsewhere is a coincidence (the "1"
+            # of "Seite 1/1"); then the row itself is shown instead of a wrong place
+            options[path] = [m for m in found if all(span[0] <= word.line <= span[1] for word in m.words)]
     chosen: dict[str, Match] = {path: found[0] for path, found in options.items() if len(found) == 1}
     for _ in range(3):  # resolved values become anchors for the rest of their group
         progress = False

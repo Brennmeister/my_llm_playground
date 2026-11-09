@@ -15,6 +15,7 @@ from typing import Optional
 from . import llm
 from .normalize import normalize_unit, parse_number
 from .schemas import LineItem, RawLineItem
+from .labels import dates_in_text
 from .table_rows import _DIMENSION, _MONEY, _QTY_UNIT, _STOP_LINE, TableRow, _join, _parse_anchor, _second_line_article
 
 log = logging.getLogger(__name__)
@@ -164,7 +165,10 @@ def fix_position_number(item: RawLineItem, printed: Optional[str], line_text: st
     must be a token of the position line, otherwise the printed one is used."""
     value = (item.position or "").strip()
     tokens = {token.lstrip("0") or "0" for token in re.findall(r"\w+", line_text)}
-    if printed and (not value or value.upper().startswith("L") or (value.lstrip("0") or "0") not in tokens):
+    if not value:
+        item.position = printed
+    elif value.upper().startswith("L") or (value.lstrip("0") or "0") not in tokens:
+        # not printed on the line: the line number. Without a printed one the sequence number is used.
         item.position = printed
 
 
@@ -233,6 +237,15 @@ def harmonize_with_line(item: RawLineItem, row: TableRow, segment: list[str], la
                 break
     if not item.unit and row.unit:
         item.unit = row.unit
+    customer_article = (item.customer_article_number or "").strip()
+    if customer_article and _squash(customer_article) not in _squash(text):
+        # taken from the header/context lines, not from this position
+        changed.append(f"customer_article_number {customer_article} -> - (not in the position lines)")
+        item.customer_article_number = None
+    if not item.delivery_date:  # a single date on the position line is its delivery date
+        dates = dates_in_text(segment[0], lang)
+        if len(dates) == 1:
+            item.delivery_date = next(iter(dates))
     below = segment[1:]
     if _suspicious_article(item.article_number, item.description):
         candidate = row.article_number
@@ -248,7 +261,7 @@ def harmonize_with_line(item: RawLineItem, row: TableRow, segment: list[str], la
         changed.append(f"description '{item.description}' not in the position lines")
         item.description = replacement
     if changed:
-        warnings.append(f"Position {item.position}: checked against its lines L{item.first_line}-L{item.last_line} "
+        warnings.append(f"Position {item.position or 'at L' + str(item.first_line)}: checked against its lines L{item.first_line}-L{item.last_line} "
                         f"({'; '.join(changed)}).")
 
 

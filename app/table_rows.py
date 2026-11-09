@@ -87,7 +87,7 @@ def _parse_anchor(line: str, lang: Optional[str]) -> Optional[TableRow]:
     if not match:
         return None
     before = line[:match.start()].split()
-    if not before or not any(re.search(r"\d", token) for token in before[:3]):
+    if not before or _STOP_LINE.match(line):
         return None
     position = int(re.split(r"[.,]", before[0])[0]) if _POSITION.match(before[0]) else None
     rest_tokens = before[1:] if position is not None else before
@@ -95,8 +95,8 @@ def _parse_anchor(line: str, lang: Optional[str]) -> Optional[TableRow]:
     if rest_tokens and _ARTICLE.match(rest_tokens[0].strip("—–-")):
         article = rest_tokens[0].strip("—–-")
         rest_tokens = rest_tokens[1:]
-    if position is None and article is None:
-        return None
+    if position is None and article is None and not re.search(r"[^\W\d_]{3,}", " ".join(rest_tokens)):
+        return None  # no position, no article, no description: not a position line
     inline = " ".join(rest_tokens).strip(" /|-—")
     after = line[match.end():]
     discount = _PERCENT.search(after)
